@@ -186,4 +186,3 @@ Expected results (from the paper, Table V):
 - Hard-negative mining uses the paper's 3:1 ratio (configurable via
   `--n_neg_ratio`).
 - Mixed-precision training is supported via `--amp` (requires CUDA).
-
