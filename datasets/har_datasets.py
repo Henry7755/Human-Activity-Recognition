@@ -46,7 +46,7 @@ DATASET_INFO: Dict[str, Dict[str, Any]] = {
     'HCI':         {'freq': 96,   'window': 96,   'n_classes':  8, 'type': 'gesture'},
     'PS':          {'freq': 50,   'window': 100,  'n_classes':  6, 'type': 'ADL'},
     'WISDM':       {'freq': 20,   'window': 200,  'n_classes':  6, 'type': 'ADL'},
-    'UCI':         {'freq': 50,   'window': 128,  'n_classes':  6, 'type': 'ADL'},
+    'UCI':         {'freq': 50,   'window': 561,  'n_classes':  6, 'type': 'ADL'},
     'OPPORTUNITY': {'freq': 30,   'window': 30,   'n_classes': 18, 'type': 'ADL'},
     'PAMAP2':      {'freq': 33,   'window': 33,   'n_classes': 18, 'type': 'ADL'},
     'UNIMIB_SHAR': {'freq': 50,   'window': 151,  'n_classes': 17, 'type': 'ADL'},
