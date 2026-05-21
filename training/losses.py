@@ -108,12 +108,12 @@ class ClassificationLoss(nn.Module):
         Returns:
             scalar loss
         """
-        B, na, _ = cls_logits.shape
+        B, na, K_plus_1 = cls_logits.shape
 
-        # Flatten over batch
-        logits = cls_logits.view(B * na, -1)          # (B*na, K+1)
-        labels = matched_labels.view(B * na)           # (B*na,)
-        pos    = pos_mask.view(B * na)                 # (B*na,)
+        # Flatten over batch - FIXED: use actual B*na, not hardcoded 256
+        logits = cls_logits.reshape(-1, K_plus_1)          # (B*na, K+1)
+        labels = matched_labels.reshape(-1)                # (B*na,)
+        pos    = pos_mask.reshape(-1)                      # (B*na,)
 
         # ---- Positive loss ----
         pos_loss = F.cross_entropy(logits[pos], labels[pos],
