@@ -8,7 +8,7 @@ Datasets (Table II of the paper):
     2. HCI         – gesture, 1 subject,  96 Hz,  8 classes
     3. PS          – ADL,     4 subjects, 50 Hz,  6 classes
     4. WISDM       – ADL,    29 subjects, 20 Hz,  6 classes
-    5. UCI         – ADL,    30 subjects, 50 Hz,  6 classes
+    5. UCI         – ADL,    30 subjects, 50 Hz,  6 classes  [UPDATED: Uses raw signals]
     6. OPPORTUNITY – ADL,     4 subjects, 30 Hz, 18 classes
     7. PAMAP2      – ADL,     9 subjects, 33 Hz, 18 classes
     8. UNIMIB SHAR – ADL,    30 subjects, 30 Hz, 17 classes
@@ -46,7 +46,7 @@ DATASET_INFO: Dict[str, Dict[str, Any]] = {
     'HCI':         {'freq': 96,   'window': 96,   'n_classes':  8, 'type': 'gesture'},
     'PS':          {'freq': 50,   'window': 100,  'n_classes':  6, 'type': 'ADL'},
     'WISDM':       {'freq': 20,   'window': 200,  'n_classes':  6, 'type': 'ADL'},
-    'UCI':         {'freq': 50,   'window': 561,  'n_classes':  6, 'type': 'ADL'},
+    'UCI':         {'freq': 50,   'window': 128,  'n_classes':  6, 'type': 'ADL'},  # UPDATED: 128 for raw signals
     'OPPORTUNITY': {'freq': 30,   'window': 30,   'n_classes': 18, 'type': 'ADL'},
     'PAMAP2':      {'freq': 33,   'window': 33,   'n_classes': 18, 'type': 'ADL'},
     'UNIMIB_SHAR': {'freq': 50,   'window': 151,  'n_classes': 17, 'type': 'ADL'},
@@ -113,25 +113,58 @@ def normalise(X: np.ndarray) -> np.ndarray:
 
 def load_UCI(data_root: str) -> Tuple[np.ndarray, np.ndarray, List]:
     """
-    UCI HAR Dataset.
+    UCI HAR Dataset - LOAD RAW SIGNALS (NOT pre-computed features).
+    
     Expected structure:
         data_root/
-            train/X_train.txt, y_train.txt
-            test/X_test.txt,  y_test.txt
+            train/
+                Inertial_Signals/body_acc_x_train.txt
+                Inertial_Signals/body_acc_y_train.txt
+                Inertial_Signals/body_acc_z_train.txt
+                Inertial_Signals/body_gyro_x_train.txt
+                Inertial_Signals/body_gyro_y_train.txt
+                Inertial_Signals/body_gyro_z_train.txt
+                Inertial_Signals/total_acc_x_train.txt
+                Inertial_Signals/total_acc_y_train.txt
+                Inertial_Signals/total_acc_z_train.txt
+                y_train.txt
+            test/
+                Inertial_Signals/[same signal files with _test]
+                y_test.txt
+    
+    Signals: 9 channels (3 acc + 3 gyro + 3 total_acc) × 128 samples @ 50 Hz
     """
     root = Path(data_root)
+    
+    # Signal file names (9 sensors)
+    signal_names = [
+        'body_acc_x', 'body_acc_y', 'body_acc_z',
+        'body_gyro_x', 'body_gyro_y', 'body_gyro_z',
+        'total_acc_x', 'total_acc_y', 'total_acc_z',
+    ]
+    
     splits = []
     for split in ('train', 'test'):
-        X = np.loadtxt(root / split / f'X_{split}.txt')   # (N, 561)
-        y = np.loadtxt(root / split / f'y_{split}.txt',
-                        dtype=int) - 1                     # 0-indexed
+        # Load activity labels
+        y_path = root / split / f'y_{split}.txt'
+        y = np.loadtxt(y_path, dtype=int) - 1  # 0-indexed
+        
+        # Load all 9 inertial signals
+        signals_list = []
+        for sig_name in signal_names:
+            sig_path = root / split / 'Inertial_Signals' / f'{sig_name}_{split}.txt'
+            sig = np.loadtxt(sig_path, dtype=np.float32)  # (N, 128)
+            signals_list.append(sig)
+        
+        # Stack: (N, 128) × 9 → (N, 9, 128)
+        X = np.stack(signals_list, axis=1)  # (N, 9, 128)
+        
         splits.append((X, y))
-
-    X = np.vstack([s[0] for s in splits]).astype(np.float32)
+    
+    # Concatenate train + test
+    X = np.vstack([s[0] for s in splits]).astype(np.float32)  # (N_total, 9, 128)
     y = np.hstack([s[1] for s in splits]).astype(np.int64)
-
-    # UCI already provides pre-windowed features; reshape to (N, C, 1)
-    X = X[:, :, np.newaxis]                                # (N, 561, 1)
+    
     segs = build_segments(y)
     return normalise(X), y, segs
 
