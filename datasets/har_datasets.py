@@ -152,7 +152,7 @@ def load_UCI(data_root: str) -> Tuple[np.ndarray, np.ndarray, List]:
         # Load all 9 inertial signals
         signals_list = []
         for sig_name in signal_names:
-            sig_path = root / split / 'Inertial_Signals' / f'{sig_name}_{split}.txt'
+            sig_path = root / split / 'Inertial Signals' / f'{sig_name}_{split}.txt'
             sig = np.loadtxt(sig_path, dtype=np.float32)  # (N, 128)
             signals_list.append(sig)
         
