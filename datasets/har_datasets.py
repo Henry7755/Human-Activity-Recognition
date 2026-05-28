@@ -454,63 +454,46 @@ def load_dataset(name: str, data_root: str
 # ---------------------------------------------------------------------------
 # PyTorch Dataset wrapper
 # ---------------------------------------------------------------------------
-
-
-
-class HARDataset(IterableDataset):
+class HARDataset(Dataset):
     """
-    Wraps (X, y) arrays into a torch IterableDataset optimized for streaming.
+    Wraps (X, y) arrays into a torch Dataset.
 
     Args:
         X        : (N, C, T) float32
         y        : (N,)      int64
-        segments : optional list of segment dicts
+        segments : optional list of segment dicts (for segmentation tasks)
         augment  : if True, apply simple Gaussian-noise augmentation
     """
+
     def __init__(self, X: np.ndarray, y: np.ndarray,
                  segments: List[Dict] = None, augment: bool = False):
-        super().__init__()
         self.X        = torch.from_numpy(X)
         self.y        = torch.from_numpy(y)
         self.segments = segments or []
         self.augment  = augment
 
-    def __iter__(self):
-        # Get information about the current DataLoader worker process
-        worker_info = torch.utils.data.get_worker_info()
-        total_samples = len(self.y)
+    def __len__(self) -> int:
+        return len(self.y)
 
-        if worker_info is None:
-            # Single-process data loading (num_workers=0)
-            start_idx = 0
-            end_idx = total_samples
-        else:
-            # Multi-process data loading (num_workers > 0)
-            # Divide the workload evenly among worker processes
-            per_worker = int(math.ceil(total_samples / float(worker_info.num_workers)))
-            worker_id = worker_info.id
-            start_idx = worker_id * per_worker
-            end_idx = min(start_idx + per_worker, total_samples)
-
-        # Yield samples sequentially for the assigned slice
-        for idx in range(start_idx, end_idx):
-            x = self.X[idx]  # (C, T)
-            if self.augment:
-                x = x + 0.01 * torch.randn_like(x)
-            
-            yield x, self.y[idx]
-
+    def __getitem__(self, idx: int):
+        x = self.X[idx]          # (C, T)
+        if self.augment:
+            x = x + 0.01 * torch.randn_like(x)
+        return x, self.y[idx]
 
 def get_dataloaders(X: np.ndarray, y: np.ndarray,
-                    segments: List[Dict] = None, # Made optional to match usage
+                    segments: List[Dict],
                     train_ratio: float = 0.70,
                     batch_size: int = 64,
                     augment: bool = True,
-                    num_workers: int = 2,
+                    num_workers: int = 4,
                     seed: int = 42
                     ) -> Tuple[DataLoader, DataLoader]:
     """
-    Split into train/test and return Iterable-style DataLoaders.
+    Split into train/test and return DataLoaders.
+
+    Train/test ratio follows the paper: 70/30 for most datasets,
+    80/20 for PAMAP2 (pass train_ratio=0.8 for that).
     """
     rng = np.random.default_rng(seed)
     N   = len(y)
@@ -519,27 +502,23 @@ def get_dataloaders(X: np.ndarray, y: np.ndarray,
 
     train_idx, test_idx = idx[:n_train], idx[n_train:]
 
-    # Instantiate the new Iterable Datasets
     train_ds = HARDataset(X[train_idx], y[train_idx],
-                          segments=segments, augment=augment)
+                          augment=augment)
     test_ds  = HARDataset(X[test_idx],  y[test_idx],
-                          segments=segments, augment=False)
+                          augment=False)
 
-    # CRITICAL: shuffle=True cannot be used with IterableDataset.
-    # Shuffling is handled implicitly above via 'rng.permutation(N)' before splitting.
     train_dl = DataLoader(train_ds, batch_size=batch_size,
-                          shuffle=False, num_workers=num_workers,
-                          pin_memory=True, drop_last=True)
-                          
+                          shuffle=True,  num_workers=num_workers,
+                          pin_memory=True)
     test_dl  = DataLoader(test_ds,  batch_size=batch_size,
                           shuffle=False, num_workers=num_workers,
-                          pin_memory=True, drop_last=False)
-                          
+                          pin_memory=True)
     return train_dl, test_dl
+
 
 # ---------------------------------------------------------------------------
 # CLI demo
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 if __name__ == '__main__':
     import sys
     name = sys.argv[1] if len(sys.argv) > 1 else 'UCI'
