@@ -78,7 +78,7 @@ def iou_matrix(windows: torch.Tensor,
     """
     na = windows.shape[0]
     nb = gt_boxes.shape[0]
-    M  = torch.zeros(na, nb)
+    M  = torch.zeros(na, nb, device=windows.device)
     for j in range(nb):
         M[:, j] = iou_1d(windows, gt_boxes[j])
     return M
