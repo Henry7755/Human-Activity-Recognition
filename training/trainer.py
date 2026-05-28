@@ -91,7 +91,7 @@ def prepare_targets(window_gen: WindowGenerator,
     all_offsets = torch.zeros(B, na, 2, dtype=torch.float32)
     all_pos     = torch.zeros(B, na, dtype=torch.bool)
 
-    anchors = window_gen.windows   # (na, 2) [center, length]
+    anchors = window_gen.windows.to(device)   # (na, 2) [center, length]
 
     for b, segs in enumerate(gt_segments):
         if not segs:
