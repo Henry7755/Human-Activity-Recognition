@@ -437,7 +437,7 @@ def parse_args() -> argparse.Namespace:
     # Loss (ablation)
     p.add_argument('--alpha',   type=float, default=1.0)
     p.add_argument('--beta',    type=float, default=1.0)
-    p.add_argument('--n_neg_ratio', type=int, default=3prepare_ta)
+    p.add_argument('--n_neg_ratio', type=int, default=3)
 
     # IOU thresholds
     p.add_argument('--pos_iou_thresh', type=float, default=0.5)
