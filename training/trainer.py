@@ -110,9 +110,9 @@ def prepare_targets(window_gen: WindowGenerator,
         gt_labels_t = torch.tensor(gt_lbl,    dtype=torch.long, device=device)
 
         lbl, off, pos = matcher.match(anchors, gt_boxes_t, gt_labels_t)
-        all_labels[b]  = lbl
-        all_offsets[b] = off
-        all_pos[b]     = pos
+        all_labels[b]  = lbl.cpu()
+        all_offsets[b] = off.cpu()
+        all_pos[b]     = pos.cpu()
 
     return (all_labels.to(device),
             all_offsets.to(device),
