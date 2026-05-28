@@ -53,9 +53,11 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
+#  Test device availability and return the appropriate torch.device (OPERATION 1)
 def get_device() -> torch.device:
-    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device('cuda')
+    # return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +106,8 @@ def prepare_targets(window_gen: WindowGenerator,
             gt_boxes.append([cx, ln])
             gt_lbl.append(s['label'] + 1)   # 1-indexed (0=background)
 
-        gt_boxes_t  = torch.tensor(gt_boxes,  dtype=torch.float32)
-        gt_labels_t = torch.tensor(gt_lbl,    dtype=torch.long)
+        gt_boxes_t  = torch.tensor(gt_boxes,  dtype=torch.float32, device=device)
+        gt_labels_t = torch.tensor(gt_lbl,    dtype=torch.long, device=device)
 
         lbl, off, pos = matcher.match(anchors, gt_boxes_t, gt_labels_t)
         all_labels[b]  = lbl
@@ -435,7 +437,7 @@ def parse_args() -> argparse.Namespace:
     # Loss (ablation)
     p.add_argument('--alpha',   type=float, default=1.0)
     p.add_argument('--beta',    type=float, default=1.0)
-    p.add_argument('--n_neg_ratio', type=int, default=3)
+    p.add_argument('--n_neg_ratio', type=int, default=3prepare_ta)
 
     # IOU thresholds
     p.add_argument('--pos_iou_thresh', type=float, default=0.5)
