@@ -1,7 +1,7 @@
 """
 training/trainer.py
 ====================
-Training and evaluation loop for MTHARS.
+Training, evaluation, and empirical monitoring loop for MTHARS.
 
 Covers:
     - Section III-E  : Training Model
@@ -9,11 +9,6 @@ Covers:
     - Section IV-D   : Dynamic Segmentation experiments
     - Section IV-E   : Activity Recognition experiments
     - Section IV-F   : Ablation experiments (α/β weights, scale s)
-
-Usage
------
-    python training/trainer.py --dataset UCI --data_root /data/UCI \
-           --epochs 100 --alpha 1.0 --beta 1.0 --scales 2 3
 """
 
 from __future__ import annotations
@@ -21,6 +16,8 @@ from __future__ import annotations
 import argparse
 import os
 import time
+import json
+import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
@@ -30,6 +27,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
 
 # Project imports
 import sys
@@ -53,11 +51,8 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-#  Test device availability and return the appropriate torch.device (OPERATION 1)
 def get_device() -> torch.device:
-    return torch.device('cuda')
-    # return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 # ---------------------------------------------------------------------------
@@ -67,22 +62,11 @@ def get_device() -> torch.device:
 def prepare_targets(window_gen: WindowGenerator,
                     matcher:    WindowMatcher,
                     gt_segments: List[List[Dict]],
-                    device:     torch.device
+                    device:      torch.device
                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Convert a batch of GT segment lists into per-window labels, offsets,
     and positive masks, ready for the loss computation.
-
-    Args:
-        window_gen   : WindowGenerator instance (anchors in data coords)
-        matcher      : WindowMatcher instance
-        gt_segments  : list (B) of lists of {'start','end','label'} dicts
-        device       : torch device
-
-    Returns:
-        matched_labels  : (B, na)
-        true_offsets    : (B, na, 2)
-        pos_mask        : (B, na) bool
     """
     B  = len(gt_segments)
     na = window_gen.num_windows
@@ -97,7 +81,6 @@ def prepare_targets(window_gen: WindowGenerator,
         if not segs:
             continue
 
-        # Convert segments to (center, length) tensor
         gt_boxes = []
         gt_lbl   = []
         for s in segs:
@@ -131,17 +114,10 @@ def train_epoch(model:       MTHARS,
                 matcher:     WindowMatcher,
                 device:      torch.device,
                 scaler:      Optional[GradScaler] = None,
-                gt_segs_all: Optional[List] = None
+                max_norm:    float = 1.0
                 ) -> Dict[str, float]:
     """
-    Run one training epoch.
-
-    Since HARDataset returns (x, label) pairs from *pre-segmented* windows,
-    we synthesise single-activity GT segments for each window to drive the
-    segmentation head.  When gt_segs_all is provided (full stream), it is
-    used directly.
-
-    Returns dict with averaged loss statistics.
+    Run one training epoch with enforced stable gradient step limitations.
     """
     model.train()
     total_stats: Dict[str, float] = {
@@ -156,7 +132,7 @@ def train_epoch(model:       MTHARS,
         B       = batch_x.shape[0]
         T       = batch_x.shape[2]
 
-        # Build pseudo GT segments: each window is one activity
+        # Build pseudo GT segments
         gt_segs = []
         for i in range(B):
             gt_segs.append([{
@@ -178,7 +154,8 @@ def train_epoch(model:       MTHARS,
                                         matched_labels, true_offsets, pos_mask)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            # Enforced tight gradient boundary to mitigate mixed-precision spikes
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -186,7 +163,7 @@ def train_epoch(model:       MTHARS,
             loss, stats = criterion(cls_logits, pred_offsets,
                                     matched_labels, true_offsets, pos_mask)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
             optimizer.step()
 
         for k in total_stats:
@@ -207,10 +184,7 @@ def evaluate(model:      MTHARS,
              n_classes:  int
              ) -> Dict[str, float]:
     """
-    Evaluate recognition accuracy and F1.
-
-    Uses the *recognition* branch only: takes argmax of the aggregated
-    class probabilities across all windows in each sample.
+    Evaluate recognition accuracy and clean F1 metrics without cross-epoch bleed.
     """
     model.eval()
     f1_meter = WeightedF1(n_classes=n_classes)
@@ -221,8 +195,9 @@ def evaluate(model:      MTHARS,
         batch_y = batch_y.to(device)
 
         cls_logits, _ = model(batch_x)        # (B, na, K+1)
-        # Aggregate: sum logits over all anchor windows, then argmax
-        agg_logits = cls_logits[:, :, 1:].mean(dim=1)   # (B, K)  – skip BG
+        
+        # Aggregate across windows, excluding the background class slice
+        agg_logits = cls_logits[:, :, 1:].mean(dim=1)   # (B, K)
         preds = agg_logits.argmax(dim=1)                 # (B,)
 
         correct += (preds == batch_y).sum().item()
@@ -231,7 +206,7 @@ def evaluate(model:      MTHARS,
 
     return {
         'accuracy': correct / max(total, 1),
-        'f1':       f1_meter.compute(),
+        'f1':        f1_meter.compute(),
     }
 
 
@@ -241,11 +216,8 @@ def evaluate(model:      MTHARS,
 
 class Trainer:
     """
-    Orchestrates dataset loading, model creation, training, and evaluation.
-
-    Supports the ablation study parameters from Section IV-F:
-        - alpha, beta   : loss weights  (Table VII)
-        - scales        : window scales (Table VIII)
+    Orchestrates data pipeline, multi-task backbones, tracking telemetry, 
+    and graphical metric reporting execution.
     """
 
     def __init__(self, cfg: argparse.Namespace):
@@ -255,12 +227,24 @@ class Trainer:
 
         info = DATASET_INFO[cfg.dataset.upper().replace('-', '_')]
         self.n_classes = info['n_classes']
-        self.window_t  = info['window']       # window size in samples
+        self.window_t  = info['window']       
         self.freq      = info['freq']
 
         print(f'Device     : {self.device}')
         print(f'Dataset    : {cfg.dataset}  ({self.n_classes} classes)')
         print(f'Window     : {self.window_t} samples @ {self.freq} Hz')
+
+        # Run Path Identification System
+        run_id = f"opt_{cfg.optimizer}_lr_{cfg.lr}_clip_{cfg.max_norm}_warm_{cfg.warmup_epochs}"
+        self.exp_dir = Path(cfg.output_dir) / cfg.dataset / run_id
+        self.exp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Deliverable 1: Isolated Input Configuration Recipe
+        with open(self.exp_dir / "hparams.json", "w") as f:
+            json.dump(vars(cfg), f, indent=4)
+
+        # Deliverable 2: Telemetry Logger Configuration
+        self.writer = SummaryWriter(log_dir=str(self.exp_dir / "telemetry"))
 
         # --- Data ---
         X, y, segs = load_dataset(cfg.dataset, cfg.data_root)
@@ -273,8 +257,7 @@ class Trainer:
             batch_size=cfg.batch_size,
             augment=cfg.augment,
         )
-        print(f'Train batches: {len(self.train_dl)} | '
-              f'Test batches: {len(self.test_dl)}')
+        print(f'Train batches: {len(self.train_dl)} | Test batches: {len(self.test_dl)}')
 
         # --- Model ---
         self.model = MTHARS(
@@ -285,7 +268,6 @@ class Trainer:
             data_len=self.window_t,
         ).to(self.device)
 
-        # --- Window infrastructure (mirrors the model's internal generator) ---
         self.window_gen = self.model.window_gen
         self.matcher    = WindowMatcher(
             pos_iou_thresh=cfg.pos_iou_thresh,
@@ -293,7 +275,6 @@ class Trainer:
             n_neg_ratio=cfg.n_neg_ratio,
         )
 
-        # --- Loss ---
         self.criterion = MTHARSLoss(
             n_classes=self.n_classes,
             alpha=cfg.alpha,
@@ -301,29 +282,45 @@ class Trainer:
             n_neg_ratio=cfg.n_neg_ratio,
         )
 
-        # --- Optimiser & scheduler ---
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=cfg.epochs, eta_min=1e-6
-        )
+        # Optimization Core Selection
+        if cfg.optimizer.lower() == 'adamw':
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=cfg.lr,
+                weight_decay=cfg.weight_decay,
+            )
+        else:
+            self.optimizer = optim.Adam(
+                self.model.parameters(),
+                lr=cfg.lr,
+                weight_decay=cfg.weight_decay,
+            )
 
-        # Mixed precision
-        self.scaler = GradScaler() if (self.device.type == 'cuda'
-                                        and cfg.amp) else None
+        # Dual-Stage Chained Warmup Scheduler Realization
+        base_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max(1, cfg.epochs - cfg.warmup_epochs), eta_min=1e-6
+        )
+        if cfg.warmup_epochs > 0:
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=0.1, total_iters=cfg.warmup_epochs
+            )
+            self.scheduler = optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, base_scheduler],
+                milestones=[cfg.warmup_epochs]
+            )
+        else:
+            self.scheduler = base_scheduler
 
+        self.scaler = GradScaler() if (self.device.type == 'cuda' and cfg.amp) else None
         self.best_f1   = 0.0
-        self.save_dir  = Path(cfg.output_dir) / cfg.dataset
-        self.save_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-
-    def run(self):
+    def run(self) -> float:
         cfg = self.cfg
-        print(f'\nStarting training for {cfg.epochs} epochs …\n')
+        print(f'\nInitialization Verification. Outputs Routing to: {self.exp_dir}\n')
+        
+        # Telemetry storage for visualization engine
+        history = {"train_loss": [], "val_f1": [], "conf_loss": [], "loc_loss": []}
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
@@ -333,12 +330,28 @@ class Trainer:
                 self.optimizer, self.criterion,
                 self.window_gen, self.matcher,
                 self.device, self.scaler,
+                max_norm=cfg.max_norm
             )
             eval_stats = evaluate(
                 self.model, self.test_dl,
                 self.device, self.n_classes,
             )
             self.scheduler.step()
+
+            # Live Telemetry Pushes to TensorBoard Logging Streams
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.writer.add_scalar('Engine/Learning_Rate', current_lr, epoch)
+            self.writer.add_scalar('Losses/Total_Loss', train_stats["total_loss"], epoch)
+            self.writer.add_scalar('Losses/Confidence_Component', train_stats["conf_loss"], epoch)
+            self.writer.add_scalar('Losses/Localization_Component', train_stats["loc_loss"], epoch)
+            self.writer.add_scalar('Evaluation/Accuracy', eval_stats["accuracy"], epoch)
+            self.writer.add_scalar('Evaluation/Macro_F1', eval_stats["f1"], epoch)
+
+            # Record internal history profiles
+            history["train_loss"].append(train_stats["total_loss"])
+            history["conf_loss"].append(train_stats["conf_loss"])
+            history["loc_loss"].append(train_stats["loc_loss"])
+            history["val_f1"].append(eval_stats["f1"])
 
             elapsed = time.time() - t0
             print(
@@ -353,17 +366,61 @@ class Trainer:
 
             if eval_stats['f1'] > self.best_f1:
                 self.best_f1 = eval_stats['f1']
-                ckpt = self.save_dir / 'best_model.pt'
+                ckpt = self.exp_dir / 'best_model.pt'
                 torch.save({
                     'epoch':     epoch,
                     'state_dict': self.model.state_dict(),
                     'f1':        self.best_f1,
-                    'cfg':       vars(cfg),
+                    'cfg':        vars(cfg),
                 }, ckpt)
                 print(f'  ✓ New best F1 {self.best_f1:.4f} saved → {ckpt}')
 
-        print(f'\nTraining complete. Best F1: {self.best_f1:.4f}')
+        self.writer.close()
+        self.generate_report_image(history)
         return self.best_f1
+
+    def generate_report_image(self, history: Dict[str, List[float]]):
+        """
+        Deliverable 3: Compiles structural training performance metadata into a PNG graphic.
+        """
+        epochs_range = range(1, len(history["train_loss"]) + 1)
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+        # Chart 1: Multi-Task Sub-loss Decomposition Curves
+        ax1.plot(epochs_range, history["train_loss"], color='black', linewidth=2, label='Total Loss')
+        ax1.plot(epochs_range, history["conf_loss"], color='crimson', linestyle=':', label='Conf Loss (α)')
+        ax1.plot(epochs_range, history["loc_loss"], color='darkorange', linestyle='--', label='Loc Loss (β)')
+        ax1.set_xlabel('Training Epochs')
+        ax1.set_ylabel('Loss Magnitudes')
+        ax1.set_title('Multi-Task Objective Component Decomposition')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+
+        # Chart 2: Target Performance Metric Progression
+        ax3 = ax2.twinx()
+        p1 = ax2.plot(epochs_range, history["train_loss"], color='tab:red', alpha=0.7, label='Train Loss')
+        p2 = ax3.plot(epochs_range, history["val_f1"], color='tab:blue', linewidth=2, label='Validation F1')
+        
+        ax2.set_xlabel('Training Epochs')
+        ax2.set_ylabel('Loss', color='tab:red')
+        ax3.set_ylabel('Macro F1 Score', color='tab:blue')
+        ax2.tick_params(axis='y', labelcolor='tab:red')
+        ax3.tick_params(axis='y', labelcolor='tab:blue')
+        
+        plots = p1 + p2
+        labels = [l.get_label() for l in plots]
+        ax2.legend(plots, labels, loc='center right')
+        ax2.set_title('Convergence Telemetry Profile')
+        ax2.grid(True, alpha=0.3)
+
+        plt.suptitle(f"Execution Analysis Matrix\nDataset: {self.cfg.dataset} | Optimizer: {self.cfg.optimizer} | Clip Norm: {self.cfg.max_norm}", fontsize=12, fontweight='bold')
+        fig.tight_layout()
+        
+        report_path = self.exp_dir / 'evaluation_report.png'
+        plt.savefig(report_path, dpi=150)
+        plt.close()
+        print(f"--> Visual Report Graph Successfully Exported to: {report_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +507,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--weight_decay', type=float, default=1e-4)
     p.add_argument('--amp',          action='store_true')
     p.add_argument('--seed',         type=int,   default=42)
+
+    # Added Experimental Tuning Architecture Hooks
+    p.add_argument('--optimizer', type=str, default='AdamW', choices=['Adam', 'AdamW'],
+                   help='Target optimization engine implementation type')
+    p.add_argument('--max_norm', type=float, default=1.0,
+                   help='Hard bound value clip maximum for backward gradient norms')
+    p.add_argument('--warmup_epochs', type=int, default=5,
+                   help='Linear training update introduction phase epoch duration')
 
     # Ablation
     p.add_argument('--ablation', action='store_true',
