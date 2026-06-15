@@ -258,7 +258,7 @@ def load_OPPORTUNITY(data_root: str) -> Tuple[np.ndarray, np.ndarray, List]:
     Expected: data_root/dataset/S{1..4}-ADL{1..5}.dat
     Uses column 244 (Locomotion label).
     """
-    root = Path(data_root) / 'datasets'
+    root = Path(data_root) / 'dataset'
     label_col = 243    # 0-indexed, Locomotion
     sensor_cols = list(range(1, 37)) + list(range(38, 46))  # subset
 
@@ -383,22 +383,40 @@ def load_PS(data_root: str) -> Tuple[np.ndarray, np.ndarray, List]:
     return normalise(X), y, segs
 
 
-def load_UNIMIB_SHAR(data_root: str) -> Tuple[np.ndarray, np.ndarray, List]:
+def load_UNIMIB_SHAR(data_root: str) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
     """
-    UniMiB SHAR Dataset.
-    Expected: data_root/full_data.mat  OR  per-class sub-folders.
+    UniMiB SHAR Dataset - Updated to load .npy files.
+    
+    Expected structure:
+        data_root/
+            full_data.npy    -> shape (N, T) or (N, 1, T)
+            full_labels.npy  -> shape (N,) or (N, 1)
     """
     root = Path(data_root)
-    fp   = root / 'full_data.mat'
+    
+    # 1. Define paths for the .npy files
+    data_path = root / 'full_data.npy'
+    labels_path = root / 'full_labels.npy'
 
-    if fp.exists():
-        mat    = loadmat(str(fp))
-        data   = mat['full_data'].astype(np.float32)    # (N, T)
-        labels = mat['full_labels'].ravel().astype(np.int64) - 1
+    # 2. Load using np.load instead of loadmat
+    if data_path.exists() and labels_path.exists():
+        data = np.load(data_path).astype(np.float32)
+        labels = np.load(labels_path)
+        
+        # Ensure labels are a flat, 1D array of integers
+        labels = labels.ravel().astype(np.int64)
+        
+        # Check if labels are 1-indexed (like the original .mat files) 
+        # and normalize to 0-indexed if necessary
+        if labels.min() > 0:
+            labels = labels - 1
     else:
-        # Fallback: iterate sub-folders named by class index
+        # Fallback: keep your original sub-folder CSV parsing logic just in case
         X_list, y_list = [], []
         class_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
+        if not class_dirs:
+            raise FileNotFoundError(f'.npy files or class directories not found in {root}')
+            
         for idx, cdir in enumerate(class_dirs):
             for fp2 in cdir.glob('*.csv'):
                 seg = np.loadtxt(fp2, delimiter=',').astype(np.float32)
@@ -407,8 +425,11 @@ def load_UNIMIB_SHAR(data_root: str) -> Tuple[np.ndarray, np.ndarray, List]:
         data   = np.stack(X_list)
         labels = np.array(y_list, dtype=np.int64)
 
+    # 3. Shape verification: Ensure it matches the (N, C, T) expected format
     if data.ndim == 2:
-        data = data[:, np.newaxis, :]       # (N, 1, T)
+        # If it's (N, T), add the channel axis -> (N, 1, T)
+        data = data[:, np.newaxis, :]  
+        
     segs = build_segments(labels)
     return normalise(data.astype(np.float32)), labels, segs
 
