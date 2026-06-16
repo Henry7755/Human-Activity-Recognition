@@ -216,6 +216,7 @@ def evaluate(model:      MTHARS,
              ) -> Dict[str, float]:
     """
     Evaluate recognition accuracy and clean F1 metrics without cross-epoch bleed.
+    Supports both global window labels and frame-by-frame sequence datasets.
     """
     model.eval()
     f1_meter = WeightedF1(n_classes=n_classes)
@@ -223,7 +224,7 @@ def evaluate(model:      MTHARS,
 
     for batch_x, batch_y in loader:
         batch_x = batch_x.to(device)
-        batch_y = batch_y.to(device)
+        batch_y = batch_y.to(device)  # Could be (B,) or (B, T)
 
         cls_logits, _ = model(batch_x)        # (B, na, K+1)
         
@@ -231,15 +232,26 @@ def evaluate(model:      MTHARS,
         agg_logits = cls_logits[:, :, 1:].mean(dim=1)   # (B, K)
         preds = agg_logits.argmax(dim=1)                 # (B,)
 
-        correct += (preds == batch_y).sum().item()
-        total   += batch_y.shape[0]
-        f1_meter.update(preds.cpu(), batch_y.cpu())
+        # ---- NEW FIX: EVALUATION SEQUENCE REDUCTION ----
+        # CHANGED: Added a dimensions check and consensus reduction step using torch.mode
+        # WHY: On window-level datasets, batch_y is [B]. On sequence datasets like SKODA, 
+        # batch_y is [B, T]. We resolve the target label sequence down to its dominant 
+        # activity class to match the prediction dimensions [B] perfectly without throwing shape errors.
+        if batch_y.dim() > 1:
+            # torch.mode returns a tuple of (values, indices); [0] extracts the values
+            eval_targets = torch.mode(batch_y, dim=1)[0]
+        else:
+            eval_targets = batch_y
+
+        # Compute accurate evaluation telemetry
+        correct += (preds == eval_targets).sum().item()
+        total   += eval_targets.shape[0]
+        f1_meter.update(preds.cpu(), eval_targets.cpu())
 
     return {
         'accuracy': correct / max(total, 1),
         'f1':        f1_meter.compute(),
     }
-
 
 # ---------------------------------------------------------------------------
 # Main Trainer
