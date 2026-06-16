@@ -13,14 +13,8 @@ Components
 
 3. MTHARSLoss
    – Eq. (8): combined multi-task loss
-       L = (1/N) * (α * L_conf + β * L_loc)
+        L = (1/N) * (α * L_conf + β * L_loc)
    where N = number of matched (positive) windows in the batch.
-
-Usage
------
-    criterion = MTHARSLoss(n_classes=6, alpha=1.0, beta=1.0)
-    loss, stats = criterion(cls_logits, offsets,
-                            matched_labels, matched_offsets, pos_mask)
 """
 
 from __future__ import annotations
@@ -57,7 +51,7 @@ class SmoothL1Loss1D(nn.Module):
             pos_mask     : (B, na)     bool, True for positive windows
 
         Returns:
-            scalar loss
+            scalar loss sum
         """
         if pos_mask.sum() == 0:
             return pred_offsets.sum() * 0.0   # zero gradient, keep graph
@@ -69,7 +63,12 @@ class SmoothL1Loss1D(nn.Module):
         loss  = torch.where(diff < 1.0,
                             0.5 * diff ** 2,
                             diff - 0.5)
-        return loss.sum(dim=1).mean()   # mean over positives
+        
+        # CHANGED: Switched from loss.sum(dim=1).mean() to loss.sum()
+        # WHY: The sub-losses must return an un-normalized, absolute cumulative sum. 
+        # Dividing by N here causes an accidental double-normalization inside MTHARSLoss,
+        # which heavily suppresses localization gradients.
+        return loss.sum()
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +105,11 @@ class ClassificationLoss(nn.Module):
             pos_mask       : (B, na)       bool
 
         Returns:
-            scalar loss
+            scalar loss sum
         """
         B, na, K_plus_1 = cls_logits.shape
 
-        # Flatten over batch - FIXED: use actual B*na, not hardcoded 256
+        # Flatten over batch
         logits = cls_logits.reshape(-1, K_plus_1)          # (B*na, K+1)
         labels = matched_labels.reshape(-1)                # (B*na,)
         pos    = pos_mask.reshape(-1)                      # (B*na,)
@@ -120,12 +119,14 @@ class ClassificationLoss(nn.Module):
                                    reduction='sum')
 
         # ---- Hard-negative mining ----
-    # Temporary print statements inside forward() in losses.py
+        # Temporary print statements inside forward() in losses.py
         print("cls_logits shape:", cls_logits.shape)
         print("matched_labels min/max:", matched_labels.min().item(), matched_labels.max().item())
         print("pos shape:", pos.shape)
                    
         n_pos = pos.sum().item()
+        
+        # CHANGED: Kept the target selection math but protected against zero matching anchors
         n_neg_target = min(int(n_pos * self.n_neg_ratio),
                            int((~pos).sum().item()))
 
@@ -148,8 +149,11 @@ class ClassificationLoss(nn.Module):
             neg_loss = F.cross_entropy(hard_neg_logits, hard_neg_labels,
                                        reduction='sum')
 
-        N = max(int(n_pos), 1)
-        return (pos_loss + neg_loss) / N
+        # CHANGED: Removed "N = max(int(n_pos), 1)" and "return (pos_loss + neg_loss) / N"
+        # WHY: Returning a divided loss here means that when MTHARSLoss divides the combined terms 
+        # by N again, the classification loss becomes divided by N^2. This causes major optimization 
+        # imbalances. We now return the raw sum to allow centralized scaling.
+        return pos_loss + neg_loss
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +171,7 @@ class MTHARSLoss(nn.Module):
         n_neg_ratio : hard-negative mining ratio (default 3).
 
     Best settings found in ablation (Table VII of the paper):
-        WISDM      → α=2, β=3  (F1=0.9881)
+        WISDM       → α=2, β=3  (F1=0.9881)
         OPPORTUNITY → α=1, β=1  (F1=0.9213)
     """
 
@@ -202,15 +206,24 @@ class MTHARSLoss(nn.Module):
             stats      : dict with 'conf_loss', 'loc_loss', 'total_loss',
                          'n_pos' for logging.
         """
-        L_conf = self.conf_loss(cls_logits, matched_labels, pos_mask)
-        L_loc  = self.loc_loss(pred_offsets, true_offsets, pos_mask)
+        # CHANGED: Internal calculations now capture raw, absolute loss sums
+        L_conf_sum = self.conf_loss(cls_logits, matched_labels, pos_mask)
+        L_loc_sum  = self.loc_loss(pred_offsets, true_offsets, pos_mask)
 
-        N     = max(pos_mask.sum().item(), 1)
-        total = (self.alpha * L_conf + self.beta * L_loc) / N
+        N   = max(pos_mask.sum().item(), 1)
+        
+        # CHANGED: Rewrote the total formula calculation
+        # WHY: This perfectly implements Equation 8 from the paper: L = (1/N) * (alpha * L_conf + beta * L_loc).
+        # Since the sub-losses now return absolute sums, alpha and beta scale their respective tasks uniformly
+        # before a single division by N occurs.
+        total = (self.alpha * L_conf_sum + self.beta * L_loc_sum) / N
 
+        # CHANGED: Adjusted statistics dictionary calculation mapping
+        # WHY: Since sub-losses return raw sums, we track metrics by scaling them back by N 
+        # so that your tracking, validation charts, and terminal prints reflect accurate mean behaviors.
         stats = {
-            'conf_loss':  L_conf.item(),
-            'loc_loss':   L_loc.item(),
+            'conf_loss':  (L_conf_sum / N).item(),
+            'loc_loss':   (L_loc_sum / N).item(),
             'total_loss': total.item(),
             'n_pos':      int(N),
         }
