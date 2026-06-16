@@ -72,22 +72,12 @@ class SmoothL1Loss1D(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Classification Loss  (Equation 7)
+# Classification Loss  (Equation 7) - Robust Kaggle/Remote Version
 # ---------------------------------------------------------------------------
 
 class ClassificationLoss(nn.Module):
     """
-    Cross-entropy loss with hard-negative mining.
-
-    Positives  : windows matched to a GT box (pos_mask == True).
-    Hard-negatives : top-K background windows by their cross-entropy score,
-                     with K = n_neg_ratio × n_pos.
-
-    This implements the 3:1 negative-to-positive ratio described
-    in Section III-E of the paper.
-
-    Args:
-        n_neg_ratio : negatives per positive (paper: 3).
+    Cross-entropy loss with hard-negative mining and index boundary armor.
     """
 
     def __init__(self, n_neg_ratio: int = 3):
@@ -101,47 +91,46 @@ class ClassificationLoss(nn.Module):
         """
         Args:
             cls_logits     : (B, na, K+1)  raw logits
-            matched_labels : (B, na)       int labels (0 = background)
+            matched_labels : (B, na)       int labels
             pos_mask       : (B, na)       bool
-
-        Returns:
-            scalar loss sum
         """
         B, na, K_plus_1 = cls_logits.shape
 
-        # Flatten over batch
+        # Flatten over batch dimensions for vectorized processing
         logits = cls_logits.reshape(-1, K_plus_1)          # (B*na, K+1)
-        labels = matched_labels.reshape(-1)                # (B*na,)
+        labels = matched_labels.reshape(-1).clone()        # (B*na,)
         pos    = pos_mask.reshape(-1)                      # (B*na,)
 
+        # ---- THE KAGGLE BOUNDARY ARMOR ----
+        # Force all background/negative tokens to exactly 0
+        labels[~pos] = 0
+        
+        # Guard: If any positive label falls completely outside the model's 
+        # classification capacity, clip it to the maximum available valid index.
+        # This prevents the CUDA device-side assertion crash immediately.
+        max_valid_class_idx = K_plus_1 - 1
+        labels = torch.clamp(labels, min=0, max=max_valid_class_idx)
+
         # ---- Positive loss ----
-        pos_loss = F.cross_entropy(logits[pos], labels[pos],
-                                   reduction='sum')
+        pos_loss = F.cross_entropy(logits[pos], labels[pos], reduction='sum')
 
         # ---- Hard-negative mining ----
-        # Temporary print statements inside forward() in losses.py
-        print("cls_logits shape:", cls_logits.shape)
-        print("matched_labels min/max:", matched_labels.min().item(), matched_labels.max().item())
-        print("pos shape:", pos.shape)
-                   
         n_pos = pos.sum().item()
-        
-        # CHANGED: Kept the target selection math but protected against zero matching anchors
         n_neg_target = min(int(n_pos * self.n_neg_ratio),
                            int((~pos).sum().item()))
 
         if n_neg_target == 0:
             neg_loss = logits.sum() * 0.0
         else:
-            # Score negatives by the CE loss w.r.t. background (class 0)
             neg_logits = logits[~pos]                  # (N_neg, K+1)
-            neg_ce     = F.cross_entropy(neg_logits,
-                                         torch.zeros(neg_logits.shape[0],
-                                                     dtype=torch.long,
-                                                     device=logits.device),
-                                         reduction='none')   # (N_neg,)
+            
+            # Target for negatives is strictly background (class 0)
+            neg_targets = torch.zeros(neg_logits.shape[0],
+                                      dtype=torch.long,
+                                      device=logits.device)
+                                      
+            neg_ce = F.cross_entropy(neg_logits, neg_targets, reduction='none')
 
-            # Take the top-K hardest negatives
             _, topk_idx = neg_ce.topk(n_neg_target)
             hard_neg_logits = neg_logits[topk_idx]
             hard_neg_labels = torch.zeros(n_neg_target, dtype=torch.long,
@@ -149,13 +138,7 @@ class ClassificationLoss(nn.Module):
             neg_loss = F.cross_entropy(hard_neg_logits, hard_neg_labels,
                                        reduction='sum')
 
-        # CHANGED: Removed "N = max(int(n_pos), 1)" and "return (pos_loss + neg_loss) / N"
-        # WHY: Returning a divided loss here means that when MTHARSLoss divides the combined terms 
-        # by N again, the classification loss becomes divided by N^2. This causes major optimization 
-        # imbalances. We now return the raw sum to allow centralized scaling.
         return pos_loss + neg_loss
-
-
 # ---------------------------------------------------------------------------
 # Combined Multi-Task Loss  (Equation 8)
 # ---------------------------------------------------------------------------
