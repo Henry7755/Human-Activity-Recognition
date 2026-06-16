@@ -101,7 +101,6 @@ def prepare_targets(window_gen: WindowGenerator,
             all_offsets.to(device),
             all_pos.to(device))
 
-
 # ---------------------------------------------------------------------------
 # Training epoch
 # ---------------------------------------------------------------------------
@@ -128,19 +127,51 @@ def train_epoch(model:       MTHARS,
 
     for batch_x, batch_y in loader:
         batch_x = batch_x.to(device, non_blocking=True)   # (B, C, T)
-        batch_y = batch_y.to(device, non_blocking=True)   # (B,)
+        batch_y = batch_y.to(device, non_blocking=True)   # (B, T) or (B,)
         B       = batch_x.shape[0]
         T       = batch_x.shape[2]
 
-        # Build pseudo GT segments
+        # ---- NEW FIX: DYNAMIC TARGET ENGINEERING ----
+        # CHANGED: Replaced static window assignment with a conditional tensor check.
+        # WHY: When using sequence-labeled datasets like SKODA, batch_y has shape [B, T]. 
+        # We must extract the actual frame boundaries of the activity segments so that 
+        # multi-scale anchors have valid boxes to match against, preventing anchor starvation (N=0).
         gt_segs = []
         for i in range(B):
-            gt_segs.append([{
-                'start': 0,
-                'end':   T - 1,
-                'label': batch_y[i].item()
-            }])
+            if batch_y.dim() > 1:
+                # Sequence Mode (e.g., SKODA / OPPORTUNITY frame-level annotations)
+                seq = batch_y[i].cpu().numpy()
+                
+                # Trace continuous segments where activity values switch
+                diffs = np.diff(seq, prepend=-1)
+                starts = np.where(diffs != 0)[0]
+                ends = np.append(starts[1:] - 1, seq.shape[0] - 1)
+                
+                sample_segs = []
+                for s, e in zip(starts, ends):
+                    if seq[s] != -1:  # Drop background/ignore padding elements if present
+                        sample_segs.append({
+                            'start': int(s), 
+                            'end': int(e), 
+                            'label': int(seq[s])
+                        })
+                
+                # Safeguard: if parsing returns nothing, fall back to the full window
+                if len(sample_segs) == 0:
+                    sample_segs.append({'start': 0, 'end': T - 1, 'label': 0})
+                gt_segs.append(sample_segs)
+            else:
+                # Legacy / Global Label Mode (Single label per window [B])
+                # WHY: For datasets providing an overall label, we inject a dual-scale 
+                # target configuration so both wide and highly localized anchors pass 
+                # the IoU matching threshold cleanly.
+                lbl = batch_y[i].item()
+                gt_segs.append([
+                    {'start': 0, 'end': T - 1, 'label': lbl},
+                    {'start': T // 4, 'end': (3 * T) // 4, 'label': lbl}
+                ])
 
+        # Pass our dynamically generated segments to your original target matching helper
         matched_labels, true_offsets, pos_mask = prepare_targets(
             window_gen, matcher, gt_segs, device
         )
