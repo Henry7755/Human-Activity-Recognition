@@ -120,6 +120,11 @@ class ClassificationLoss(nn.Module):
                                    reduction='sum')
 
         # ---- Hard-negative mining ----
+    # Temporary print statements inside forward() in losses.py
+        print("cls_logits shape:", cls_logits.shape)
+        print("matched_labels min/max:", matched_labels.min().item(), matched_labels.max().item())
+        print("pos shape:", pos.shape)
+                   
         n_pos = pos.sum().item()
         n_neg_target = min(int(n_pos * self.n_neg_ratio),
                            int((~pos).sum().item()))
