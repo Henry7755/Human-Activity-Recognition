@@ -530,10 +530,10 @@ def get_dataloaders(X: np.ndarray, y: np.ndarray,
 
     train_dl = DataLoader(train_ds, batch_size=batch_size,
                           shuffle=True,  num_workers=num_workers,
-                          pin_memory=True)
+                          pin_memory=pin_memory)
     test_dl  = DataLoader(test_ds,  batch_size=batch_size,
                           shuffle=False, num_workers=num_workers,
-                          pin_memory=True)
+                          pin_memory=pin_memory)
     return train_dl, test_dl
 
 
