@@ -9,6 +9,11 @@ Covers:
     - Section IV-D   : Dynamic Segmentation experiments
     - Section IV-E   : Activity Recognition experiments
     - Section IV-F   : Ablation experiments (α/β weights, scale s)
+    
+GPU SUPPORT:
+    - Multi-GPU training via torch.nn.DataParallel
+    - Mixed precision (AMP) for faster training
+    - Non-blocking data transfer for optimal GPU utilization
 """
 
 from __future__ import annotations
@@ -41,8 +46,36 @@ from training.losses import MTHARSLoss, WeightedF1
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# GPU Utilities
 # ---------------------------------------------------------------------------
+
+def get_multi_gpu_device() -> Tuple[torch.device, int]:
+    """
+    Detect available GPUs and set optimal device strategy.
+    
+    Returns:
+        device: torch.device ('cuda:0' if GPU available, else 'cpu')
+        num_gpus: int (number of GPUs detected)
+    """
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"\n{'='*80}")
+        print(f"  🎯 GPU ACCELERATION ENABLED")
+        print(f"{'='*80}")
+        print(f"  ✓ Found {num_gpus} GPU(s) available")
+        
+        # Print GPU details
+        for i in range(num_gpus):
+            props = torch.cuda.get_device_properties(i)
+            print(f"    GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB)")
+        
+        device = torch.device('cuda:0')
+        print(f"  ✓ Primary device: {device}\n")
+        return device, num_gpus
+    else:
+        print("\n⚠ No GPU found, falling back to CPU")
+        return torch.device('cpu'), 0
+
 
 def set_seed(seed: int = 42):
     import random
@@ -117,6 +150,7 @@ def train_epoch(model:       MTHARS,
                 ) -> Dict[str, float]:
     """
     Run one training epoch with enforced stable gradient step limitations.
+    Supports both single-GPU and multi-GPU training.
     """
     model.train()
     total_stats: Dict[str, float] = {
@@ -126,6 +160,7 @@ def train_epoch(model:       MTHARS,
     n_batches = 0
 
     for batch_x, batch_y in loader:
+        # Non-blocking transfer for better GPU utilization
         batch_x = batch_x.to(device, non_blocking=True)   # (B, C, T)
         batch_y = batch_y.to(device, non_blocking=True)   # (B, T) or (B,)
         B       = batch_x.shape[0]
@@ -223,8 +258,8 @@ def evaluate(model:      MTHARS,
     correct = total = 0
 
     for batch_x, batch_y in loader:
-        batch_x = batch_x.to(device)
-        batch_y = batch_y.to(device)  # Could be (B,) or (B, T)
+        batch_x = batch_x.to(device, non_blocking=True)
+        batch_y = batch_y.to(device, non_blocking=True)
 
         cls_logits, _ = model(batch_x)        # (B, na, K+1)
         
@@ -261,11 +296,20 @@ class Trainer:
     """
     Orchestrates data pipeline, multi-task backbones, tracking telemetry, 
     and graphical metric reporting execution.
+    
+    Now with multi-GPU support via DataParallel wrapper.
     """
 
-    def __init__(self, cfg: argparse.Namespace):
+    def __init__(self, cfg: argparse.Namespace, device: torch.device = None, num_gpus: int = None):
         self.cfg    = cfg
-        self.device = get_device()
+        
+        # Auto-detect GPU if not provided
+        if device is None:
+            self.device, self.num_gpus = get_multi_gpu_device()
+        else:
+            self.device = device
+            self.num_gpus = num_gpus or (1 if device.type == 'cuda' else 0)
+        
         set_seed(cfg.seed)
 
         info = DATASET_INFO[cfg.dataset.upper().replace('-', '_')]
@@ -274,6 +318,7 @@ class Trainer:
         self.freq      = info['freq']
 
         print(f'Device     : {self.device}')
+        print(f'GPUs       : {self.num_gpus}')
         print(f'Dataset    : {cfg.dataset}  ({self.n_classes} classes)')
         print(f'Window     : {self.window_t} samples @ {self.freq} Hz')
 
@@ -299,6 +344,8 @@ class Trainer:
             train_ratio=train_ratio,
             batch_size=cfg.batch_size,
             augment=cfg.augment,
+            num_workers=cfg.num_workers,  # Parallel data loading
+            pin_memory=(self.num_gpus > 0),  # Pin memory for GPU transfer
         )
         print(f'Train batches: {len(self.train_dl)} | Test batches: {len(self.test_dl)}')
 
@@ -311,7 +358,16 @@ class Trainer:
             data_len=self.window_t,
         ).to(self.device)
 
-        self.window_gen = self.model.window_gen
+        # ── MULTI-GPU WRAPPER ───────────────────────────────────────────────────
+        # Wrap model for multi-GPU training if available
+        if self.num_gpus > 1:
+            print(f"\n📦 Wrapping model for {self.num_gpus}-GPU training via DataParallel")
+            self.model = nn.DataParallel(self.model)
+            print(f"✓ Model wrapped and distributed across GPUs\n")
+        else:
+            self.model = self.model.to(self.device)
+
+        self.window_gen = self.model.module.window_gen if isinstance(self.model, nn.DataParallel) else self.model.window_gen
         self.matcher    = WindowMatcher(
             pos_iou_thresh=cfg.pos_iou_thresh,
             neg_iou_thresh=cfg.neg_iou_thresh,
@@ -410,9 +466,13 @@ class Trainer:
             if eval_stats['f1'] > self.best_f1:
                 self.best_f1 = eval_stats['f1']
                 ckpt = self.exp_dir / 'best_model.pt'
+                
+                # Save model correctly for both single and multi-GPU
+                model_state = self.model.module.state_dict() if isinstance(self.model, nn.DataParallel) else self.model.state_dict()
+                
                 torch.save({
                     'epoch':     epoch,
-                    'state_dict': self.model.state_dict(),
+                    'state_dict': model_state,
                     'f1':        self.best_f1,
                     'cfg':        vars(cfg),
                 }, ckpt)
@@ -457,7 +517,8 @@ class Trainer:
         ax2.set_title('Convergence Telemetry Profile')
         ax2.grid(True, alpha=0.3)
 
-        plt.suptitle(f"Execution Analysis Matrix\nDataset: {self.cfg.dataset} | Optimizer: {self.cfg.optimizer} | Clip Norm: {self.cfg.max_norm}", fontsize=12, fontweight='bold')
+        gpu_info = f"GPU Mode ({self.num_gpus} GPUs)" if self.num_gpus > 0 else "CPU Mode"
+        plt.suptitle(f"Execution Analysis Matrix\nDataset: {self.cfg.dataset} | Optimizer: {self.cfg.optimizer} | {gpu_info}", fontsize=12, fontweight='bold')
         fig.tight_layout()
         
         report_path = self.exp_dir / 'evaluation_report.png'
@@ -548,7 +609,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--batch_size',   type=int,   default=64)
     p.add_argument('--lr',           type=float, default=1e-3)
     p.add_argument('--weight_decay', type=float, default=1e-4)
-    p.add_argument('--amp',          action='store_true')
+    p.add_argument('--amp',          action='store_true', default=True, help='Enable automatic mixed precision')
     p.add_argument('--seed',         type=int,   default=42)
 
     # Added Experimental Tuning Architecture Hooks
@@ -558,6 +619,12 @@ def parse_args() -> argparse.Namespace:
                    help='Hard bound value clip maximum for backward gradient norms')
     p.add_argument('--warmup_epochs', type=int, default=5,
                    help='Linear training update introduction phase epoch duration')
+
+    # ── GPU OPTIMIZATION PARAMETERS ────────────────────────────────────────
+    p.add_argument('--num_workers', type=int, default=4,
+                   help='Number of workers for parallel data loading (optimal for Kaggle GPUs)')
+    p.add_argument('--use_multi_gpu', action='store_true', default=True,
+                   help='Enable multi-GPU training via DataParallel if available')
 
     # Ablation
     p.add_argument('--ablation', action='store_true',
