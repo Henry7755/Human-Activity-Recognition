@@ -508,7 +508,7 @@ def get_dataloaders(X: np.ndarray, y: np.ndarray,
                     batch_size: int = 64,
                     augment: bool = True,
                     num_workers: int = 4,
-                    pin_memory: bool = False,
+                    pin_memory: bool = True,
                     seed: int = 42
                     ) -> Tuple[DataLoader, DataLoader]:
     """
