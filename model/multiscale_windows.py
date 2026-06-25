@@ -286,29 +286,37 @@ class WindowMatcher:
             M_work[i, :] = -1       # discard row
             M_work[:, j] = -1       # discard column
 
-        # ---- Step 2: match remaining windows by threshold ----
-        for i in range(na):
-            if assigned_gt[i] >= 0:
-                continue                          # already assigned
-            row_iou = M[i]                        # (nb,)
-            best_j  = row_iou.argmax()
-            best_iou = row_iou[best_j].item()
+        # ---- Step 2: match remaining windows by threshold (vectorized) ----
+        # FIX: previously this was `for i in range(na): ... .item()`, a
+        # Python loop over every anchor (na can be hundreds) with a
+        # GPU->CPU sync on every iteration. Called once per sample per
+        # batch, this is exactly what pegs the CPU at 100% while the GPUs
+        # sit idle. Replaced with vectorized tensor ops computed once for
+        # all anchors at the same time, with zero per-anchor host syncs.
+        unassigned = assigned_gt < 0
+        best_iou, best_j = M.max(dim=1)            # (na,), (na,) -- one shot, no loop
 
-            if best_iou >= self.pos_iou_thresh:
-                assigned_gt[i] = best_j
-            elif best_iou >= self.neg_iou_thresh:
-                assigned_gt[i] = -2              # ignore (between thresholds)
-            # else: remains -1 → background
+        take_pos = unassigned & (best_iou >= self.pos_iou_thresh)
+        take_ignore = (unassigned
+                       & (best_iou >= self.neg_iou_thresh)
+                       & (best_iou < self.pos_iou_thresh))
 
-        # ---- Step 3: encode labels and offsets ----
+        assigned_gt = torch.where(take_pos, best_j, assigned_gt)
+        assigned_gt = torch.where(
+            take_ignore, torch.full_like(assigned_gt, -2), assigned_gt
+        )
+
+        # ---- Step 3: encode labels and offsets (vectorized) ----
+        # FIX: same problem as Step 2 -- replaced the per-anchor Python loop
+        # (and its `.item()` call on every iteration) with a single gather
+        # over just the positive windows. If there are zero positives,
+        # pos_idx is simply an empty tensor and every op below becomes a
+        # cheap no-op -- no Python-level branching or host sync needed.
         pos_mask = assigned_gt >= 0
-        for i in range(na):
-            j = assigned_gt[i].item()
-            if j >= 0:
-                matched_labels[i]     = gt_labels[j]
-                matched_offsets[i]    = offset_encode(
-                    windows[i:i+1], gt_boxes[j:j+1]
-                ).squeeze(0)
+        pos_idx  = pos_mask.nonzero(as_tuple=True)[0]
+        j_idx    = assigned_gt[pos_idx]
+        matched_labels[pos_idx]  = gt_labels[j_idx]
+        matched_offsets[pos_idx] = offset_encode(windows[pos_idx], gt_boxes[j_idx])
 
         return matched_labels, matched_offsets, pos_mask
 
