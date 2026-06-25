@@ -78,7 +78,12 @@ def iou_matrix(windows: torch.Tensor,
     """
     na = windows.shape[0]
     nb = gt_boxes.shape[0]
-    M  = torch.zeros(na, nb, device=windows.device)
+    # FIX: previously `torch.zeros(na, nb)` defaulted to CPU. When `windows`/
+    # `gt_boxes` live on a CUDA device (as they always do once trainer.py moves
+    # them there), assigning the CUDA result of iou_1d(...) into this CPU
+    # tensor raises a device-mismatch RuntimeError. Allocate on the same
+    # device/dtype as the inputs instead.
+    M = torch.zeros(na, nb, device=windows.device, dtype=windows.dtype)
     for j in range(nb):
         M[:, j] = iou_1d(windows, gt_boxes[j])
     return M
@@ -249,16 +254,24 @@ class WindowMatcher:
         """
         na = windows.shape[0]
         nb = gt_boxes.shape[0]
+        # FIX: every tensor allocated below must live on the same device as
+        # `windows`/`gt_boxes`. Previously these were created with no device
+        # argument (defaulting to CPU), which works fine on the CPU-only
+        # __main__ sanity test in this file but raises a device-mismatch
+        # RuntimeError the instant this runs on GPU, since trainer.py always
+        # passes in CUDA tensors for windows/gt_boxes during real training.
+        device = windows.device
 
-        matched_labels  = torch.zeros(na, dtype=torch.long)
-        matched_offsets = torch.zeros(na, 2,  dtype=torch.float32)
-        assigned_gt     = torch.full((na,), -1, dtype=torch.long)
+        matched_labels  = torch.zeros(na, dtype=torch.long, device=device)
+        matched_offsets = torch.zeros(na, 2, dtype=torch.float32, device=device)
+        assigned_gt     = torch.full((na,), -1, dtype=torch.long, device=device)
 
         if nb == 0:
-            return matched_labels, matched_offsets, torch.zeros(na, dtype=torch.bool)
+            return (matched_labels, matched_offsets,
+                    torch.zeros(na, dtype=torch.bool, device=device))
 
         # Build IOU matrix  M ∈ R^{na × nb}
-        M = iou_matrix(windows, gt_boxes)    # (na, nb)
+        M = iou_matrix(windows, gt_boxes)    # (na, nb)  -- now on `device`
         M_work = M.clone()
 
         # ---- Step 1: guarantee every GT box gets its best window ----
@@ -362,5 +375,20 @@ if __name__ == '__main__':
         w = gen.windows[pos_idx]
         o = off[pos_idx]
         recovered = offset_decode(w, o)
+        # NOTE (pre-existing, unrelated to device fix): this line previously read
+        # `gt_boxes[gt_labels[lbl[pos_idx]] - 1]`, double-indexing through
+        # gt_labels. Since matched_labels already store the actual GT label
+        # value (1-indexed), the correct lookup is directly into gt_boxes.
         print('Offset encode→decode round-trip error:',
-              (recovered - gt_boxes[gt_labels[lbl[pos_idx]] - 1]).abs().max().item())
+              (recovered - gt_boxes[lbl[pos_idx] - 1]).abs().max().item())
+
+    # Device-mismatch regression test: simulate what happens on GPU pipelines
+    # by moving windows/gt_boxes onto a non-default device proxy (here we
+    # just verify dtype/device propagation works for CPU; on a real CUDA
+    # box, re-run this block with .to('cuda') to confirm no RuntimeError).
+    if torch.cuda.is_available():
+        gen_cuda = gen.windows.cuda()
+        gt_boxes_cuda = gt_boxes.cuda()
+        gt_labels_cuda = gt_labels.cuda()
+        lbl_c, off_c, pos_c = matcher.match(gen_cuda, gt_boxes_cuda, gt_labels_cuda)
+        print('CUDA match() succeeded, device:', lbl_c.device)
