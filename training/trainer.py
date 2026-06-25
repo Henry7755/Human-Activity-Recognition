@@ -308,8 +308,11 @@ class Trainer:
             self.device, self.num_gpus = get_multi_gpu_device()
         else:
             self.device = device
-            self.num_gpus = num_gpus or (1 if device.type == 'cuda' else 0)
-        
+            # FIX: previously `num_gpus or (1 if device.type == 'cuda' else 0)` would
+            # silently collapse to 1 GPU whenever num_gpus wasn't explicitly passed in,
+            # even if 2 GPUs were physically available. Query the real count instead.
+            self.num_gpus = num_gpus if num_gpus is not None else torch.cuda.device_count()
+
         set_seed(cfg.seed)
 
         info = DATASET_INFO[cfg.dataset.upper().replace('-', '_')]
@@ -359,8 +362,12 @@ class Trainer:
         ).to(self.device)
 
         # ── MULTI-GPU WRAPPER ───────────────────────────────────────────────────
-        # Wrap model for multi-GPU training if available
-        if self.num_gpus > 1:
+        # Wrap model for multi-GPU training if available.
+        # FIX: previously this only checked `self.num_gpus > 1` and ignored
+        # cfg.use_multi_gpu entirely, making that CLI flag dead/no-op. Now it
+        # actually gates on the flag, so --use_multi_gpu (or its default) controls
+        # whether DataParallel is used.
+        if cfg.use_multi_gpu and self.num_gpus > 1:
             print(f"\n📦 Wrapping model for {self.num_gpus}-GPU training via DataParallel")
             self.model = nn.DataParallel(self.model)
             print(f"✓ Model wrapped and distributed across GPUs\n")
