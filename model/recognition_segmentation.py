@@ -100,7 +100,13 @@ class NonMaximumSuppression:
         fg_classes = fg_classes[order]
 
         kept_idx = []
-        suppressed = torch.zeros(len(windows), dtype=torch.bool)
+        # FIX: previously `torch.zeros(len(windows), dtype=torch.bool)` and the
+        # `torch.tensor(kept_idx, dtype=torch.long)` below both defaulted to
+        # CPU. When `windows` (and therefore `class_probs`) live on a CUDA
+        # device — which they will the moment predict() is called on a GPU
+        # model — indexing/assigning across these mismatched devices raises a
+        # RuntimeError. Allocate both on windows.device instead.
+        suppressed = torch.zeros(len(windows), dtype=torch.bool, device=windows.device)
 
         for i in range(len(windows)):
             if suppressed[i]:
@@ -114,7 +120,7 @@ class NonMaximumSuppression:
             suppress_mask = iou > self.iou_thresh
             suppressed[i+1:][suppress_mask] = True
 
-        kept_idx = torch.tensor(kept_idx, dtype=torch.long)
+        kept_idx = torch.tensor(kept_idx, dtype=torch.long, device=windows.device)
         return windows[kept_idx], fg_probs[kept_idx], fg_classes[kept_idx]
 
 
