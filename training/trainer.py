@@ -342,12 +342,15 @@ class Trainer:
         self.in_channels = X.shape[1]
 
         train_ratio = 0.80 if cfg.dataset.upper() == 'PAMAP2' else 0.70
+        # FIX: same getattr-with-default pattern as use_multi_gpu above —
+        # num_workers is another recently-added flag, default 4 in the CLI,
+        # that a hand-built notebook Namespace likely never set.
         self.train_dl, self.test_dl = get_dataloaders(
             X, y, segs,
             train_ratio=train_ratio,
             batch_size=cfg.batch_size,
             augment=cfg.augment,
-            num_workers=cfg.num_workers,  # Parallel data loading
+            num_workers=getattr(cfg, 'num_workers', 4),  # Parallel data loading
             pin_memory=(self.num_gpus > 0),  # Pin memory for GPU transfer
         )
         print(f'Train batches: {len(self.train_dl)} | Test batches: {len(self.test_dl)}')
@@ -367,7 +370,14 @@ class Trainer:
         # cfg.use_multi_gpu entirely, making that CLI flag dead/no-op. Now it
         # actually gates on the flag, so --use_multi_gpu (or its default) controls
         # whether DataParallel is used.
-        if cfg.use_multi_gpu and self.num_gpus > 1:
+        # FIX: use getattr with a default instead of cfg.use_multi_gpu directly.
+        # In notebook environments (Kaggle/Colab) people often build `cfg` by
+        # hand as argparse.Namespace(...) instead of going through parse_args(),
+        # which means any flag they didn't explicitly set (like use_multi_gpu)
+        # simply doesn't exist on the object yet, and a direct attribute access
+        # raises AttributeError. getattr(..., True) falls back to the same
+        # default that parse_args() would have given it via add_argument.
+        if getattr(cfg, 'use_multi_gpu', True) and self.num_gpus > 1:
             print(f"\n📦 Wrapping model for {self.num_gpus}-GPU training via DataParallel")
             self.model = nn.DataParallel(self.model)
             print(f"✓ Model wrapped and distributed across GPUs\n")
@@ -587,7 +597,7 @@ def run_ablation_study(base_cfg: argparse.Namespace) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description='Train MTHARS')
 
     # Data
@@ -637,7 +647,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--ablation', action='store_true',
                    help='Run full ablation study (Sec IV-F)')
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 if __name__ == '__main__':
