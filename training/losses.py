@@ -1,20 +1,17 @@
 """
 training/losses.py
 ==================
-Loss functions for MTHARS training (Section III-E of the paper).
+Loss functions for MTHARS training (Recognition-only variant).
 
 Components
 ----------
-1. SmoothL1Loss1D
-   – Eq. (5)+(6): element-wise Smooth-L1 for offset regression.
-
-2. ClassificationLoss
+1. ClassificationLoss
    – Eq. (7): cross-entropy over matched positive + hard-negative windows.
 
-3. MTHARSLoss
-   – Eq. (8): combined multi-task loss
-        L = (1/N) * (α * L_conf + β * L_loc)
-   where N = number of matched (positive) windows in the batch.
+2. MTHARSLoss (Refactored)
+   – Recognition-only loss: L = (1/N) * L_conf
+   – Removed all localization (offset regression) components.
+   – Simplified to pure classification task.
 """
 
 from __future__ import annotations
@@ -24,51 +21,6 @@ from typing import Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# ---------------------------------------------------------------------------
-# Smooth-L1 (Equations 5 & 6)
-# ---------------------------------------------------------------------------
-
-class SmoothL1Loss1D(nn.Module):
-    """
-    Smooth-L1 loss for the offset regression branch.
-
-    SmoothL1(x) = 0.5 * x²   if |x| < 1
-                  |x| - 0.5  otherwise
-
-    Applied only to *positive* windows (those matched to a GT box).
-    """
-
-    def forward(self,
-                pred_offsets: torch.Tensor,
-                true_offsets: torch.Tensor,
-                pos_mask:     torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            pred_offsets : (B, na, 2)  predicted (f_x, f_l)
-            true_offsets : (B, na, 2)  encoded ground-truth offsets
-            pos_mask     : (B, na)     bool, True for positive windows
-
-        Returns:
-            scalar loss sum
-        """
-        if pos_mask.sum() == 0:
-            return pred_offsets.sum() * 0.0   # zero gradient, keep graph
-
-        pred = pred_offsets[pos_mask]   # (P, 2)
-        true = true_offsets[pos_mask]   # (P, 2)
-
-        diff  = (pred - true).abs()
-        loss  = torch.where(diff < 1.0,
-                            0.5 * diff ** 2,
-                            diff - 0.5)
-        
-        # CHANGED: Switched from loss.sum(dim=1).mean() to loss.sum()
-        # WHY: The sub-losses must return an un-normalized, absolute cumulative sum. 
-        # Dividing by N here causes an accidental double-normalization inside MTHARSLoss,
-        # which heavily suppresses localization gradients.
-        return loss.sum()
 
 
 # ---------------------------------------------------------------------------
@@ -139,74 +91,60 @@ class ClassificationLoss(nn.Module):
                                        reduction='sum')
 
         return pos_loss + neg_loss
+
+
 # ---------------------------------------------------------------------------
-# Combined Multi-Task Loss  (Equation 8)
+# Combined Classification-Only Loss (Refactored)
 # ---------------------------------------------------------------------------
 
 class MTHARSLoss(nn.Module):
     """
-    L = (1/N) * (α * L_conf + β * L_loc)
+    Recognition-only loss (simplified from original multi-task).
+    
+    L = (1/N) * L_conf
+    
+    where N = number of matched (positive) windows in the batch.
 
     Args:
         n_classes   : K (number of activity classes, excluding background).
-        alpha       : weight for the classification loss (default 1.0).
-        beta        : weight for the localisation (offset) loss (default 1.0).
         n_neg_ratio : hard-negative mining ratio (default 3).
-
-    Best settings found in ablation (Table VII of the paper):
-        WISDM       → α=2, β=3  (F1=0.9881)
-        OPPORTUNITY → α=1, β=1  (F1=0.9213)
+    
+    Note: alpha and beta parameters removed (no longer used).
     """
 
     def __init__(self,
                  n_classes:   int,
-                 alpha:       float = 1.0,
-                 beta:        float = 1.0,
-                 n_neg_ratio: int   = 3):
+                 n_neg_ratio: int = 3,
+                 **kwargs):  # Accept but ignore alpha, beta for backward compatibility
         super().__init__()
-        self.alpha = alpha
-        self.beta  = beta
-        self.loc_loss  = SmoothL1Loss1D()
         self.conf_loss = ClassificationLoss(n_neg_ratio=n_neg_ratio)
 
     def forward(self,
                 cls_logits:     torch.Tensor,
-                pred_offsets:   torch.Tensor,
                 matched_labels: torch.Tensor,
-                true_offsets:   torch.Tensor,
                 pos_mask:       torch.Tensor
                 ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Args:
             cls_logits     : (B, na, K+1)
-            pred_offsets   : (B, na, 2)
             matched_labels : (B, na)      ground-truth class per window
-            true_offsets   : (B, na, 2)   encoded ground-truth offsets
             pos_mask       : (B, na) bool
 
         Returns:
             total_loss : scalar
-            stats      : dict with 'conf_loss', 'loc_loss', 'total_loss',
-                         'n_pos' for logging.
+            stats      : dict with 'conf_loss', 'total_loss', 'n_pos' for logging.
         """
-        # CHANGED: Internal calculations now capture raw, absolute loss sums
+        # Compute classification loss (only loss component)
         L_conf_sum = self.conf_loss(cls_logits, matched_labels, pos_mask)
-        L_loc_sum  = self.loc_loss(pred_offsets, true_offsets, pos_mask)
 
-        N   = max(pos_mask.sum().item(), 1)
+        N = max(pos_mask.sum().item(), 1)
         
-        # CHANGED: Rewrote the total formula calculation
-        # WHY: This perfectly implements Equation 8 from the paper: L = (1/N) * (alpha * L_conf + beta * L_loc).
-        # Since the sub-losses now return absolute sums, alpha and beta scale their respective tasks uniformly
-        # before a single division by N occurs.
-        total = (self.alpha * L_conf_sum + self.beta * L_loc_sum) / N
+        # Total loss is simply normalized classification loss
+        total = L_conf_sum / N
 
-        # CHANGED: Adjusted statistics dictionary calculation mapping
-        # WHY: Since sub-losses return raw sums, we track metrics by scaling them back by N 
-        # so that your tracking, validation charts, and terminal prints reflect accurate mean behaviors.
+        # Stats dictionary: only classification metrics
         stats = {
             'conf_loss':  (L_conf_sum / N).item(),
-            'loc_loss':   (L_loc_sum / N).item(),
             'total_loss': total.item(),
             'n_pos':      int(N),
         }
@@ -268,20 +206,16 @@ if __name__ == '__main__':
     B, na, K = 2, 64, 6
 
     cls_logits     = torch.randn(B, na, K + 1)
-    pred_offsets   = torch.randn(B, na, 2)
     matched_labels = torch.randint(0, K + 1, (B, na))
-    true_offsets   = torch.randn(B, na, 2)
 
     # ~20 % positive windows
     pos_mask = torch.rand(B, na) > 0.80
 
-    criterion = MTHARSLoss(n_classes=K, alpha=1.0, beta=1.0)
-    loss, stats = criterion(cls_logits, pred_offsets,
-                            matched_labels, true_offsets, pos_mask)
+    criterion = MTHARSLoss(n_classes=K)
+    loss, stats = criterion(cls_logits, matched_labels, pos_mask)
 
     print(f'Total loss : {stats["total_loss"]:.4f}')
     print(f'  conf     : {stats["conf_loss"]:.4f}')
-    print(f'  loc      : {stats["loc_loss"]:.4f}')
     print(f'  n_pos    : {stats["n_pos"]}')
 
     # F1 test
