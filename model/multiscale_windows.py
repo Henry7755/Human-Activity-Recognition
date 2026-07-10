@@ -1,7 +1,7 @@
 """
 model/multiscale_windows.py
 ============================
-Section III-B of the paper: Multiscale Window Generation and Matching.
+Section III-B of the paper: Multiscale Window Generation and Matching (Recognition-only variant).
 
 Components
 ----------
@@ -17,11 +17,7 @@ Components
      activity bounding box using the greedy Hungarian-style algorithm
      described in the paper (Section III-B, "Multiscale window labeling
      and matching").
-
-4. offset_encode / offset_decode
-   – Equations (1)-(4): convert between absolute boundaries and the
-     (center-offset, log-length-offset) parameterisation used during
-     training and inference.
+   – REFACTORED: removed offset_encode() call and matched_offsets generation.
 """
 
 from __future__ import annotations
@@ -78,11 +74,6 @@ def iou_matrix(windows: torch.Tensor,
     """
     na = windows.shape[0]
     nb = gt_boxes.shape[0]
-    # FIX: previously `torch.zeros(na, nb)` defaulted to CPU. When `windows`/
-    # `gt_boxes` live on a CUDA device (as they always do once trainer.py moves
-    # them there), assigning the CUDA result of iou_1d(...) into this CPU
-    # tensor raises a device-mismatch RuntimeError. Allocate on the same
-    # device/dtype as the inputs instead.
     M = torch.zeros(na, nb, device=windows.device, dtype=windows.dtype)
     for j in range(nb):
         M[:, j] = iou_1d(windows, gt_boxes[j])
@@ -158,53 +149,7 @@ class WindowGenerator:
 
 
 # ---------------------------------------------------------------------------
-# Offset encoding / decoding  (Equations 1-4)
-# ---------------------------------------------------------------------------
-
-def offset_encode(windows: torch.Tensor,
-                  gt_boxes: torch.Tensor) -> torch.Tensor:
-    """
-    Encode ground-truth boxes relative to matched windows.
-
-    Implements Equations (1) and (2):
-        f_x = (t_x - w_x) / w_l
-        f_l = log(t_l / w_l)
-
-    Args:
-        windows  : (N, 2)  matched windows [center, length]
-        gt_boxes : (N, 2)  matched GT boxes [center, length]
-
-    Returns:
-        offsets : (N, 2)  [f_x, f_l]
-    """
-    f_x = (gt_boxes[:, 0] - windows[:, 0]) / windows[:, 1].clamp(min=1e-6)
-    f_l = torch.log(gt_boxes[:, 1] / windows[:, 1].clamp(min=1e-6))
-    return torch.stack([f_x, f_l], dim=1)
-
-
-def offset_decode(windows: torch.Tensor,
-                  offsets: torch.Tensor) -> torch.Tensor:
-    """
-    Decode predicted offsets back to absolute boundaries.
-
-    Implements Equations (3) and (4):
-        t̂_x = f_x * w_l + w_x
-        t̂_l = w_l * exp(f_l)
-
-    Args:
-        windows : (N, 2)  anchor windows [center, length]
-        offsets : (N, 2)  predicted offsets [f_x, f_l]
-
-    Returns:
-        pred_boxes : (N, 2)  predicted boundaries [center, length]
-    """
-    pred_x = offsets[:, 0] * windows[:, 1] + windows[:, 0]
-    pred_l = windows[:, 1] * torch.exp(offsets[:, 1])
-    return torch.stack([pred_x, pred_l], dim=1)
-
-
-# ---------------------------------------------------------------------------
-# Window Matcher
+# Window Matcher (Recognition-only variant)
 # ---------------------------------------------------------------------------
 
 class WindowMatcher:
@@ -225,6 +170,8 @@ class WindowMatcher:
         neg_iou_thresh : maximum IOU for a window to be labelled background
         n_neg_ratio    : ratio of negatives to positives for hard-negative
                          mining during training (paper uses 3:1)
+    
+    REFACTORED: removed offset_encode() call and matched_offsets generation.
     """
 
     def __init__(self,
@@ -239,7 +186,7 @@ class WindowMatcher:
               windows:  torch.Tensor,
               gt_boxes: torch.Tensor,
               gt_labels: torch.Tensor
-              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+              ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             windows   : (na, 2)  anchor windows [center, length]
@@ -249,29 +196,20 @@ class WindowMatcher:
 
         Returns:
             matched_labels  : (na,)    class label per window (0=background)
-            matched_offsets : (na, 2)  encoded offsets (valid for positives)
             pos_mask        : (na,)    bool mask of positive windows
         """
         na = windows.shape[0]
         nb = gt_boxes.shape[0]
-        # FIX: every tensor allocated below must live on the same device as
-        # `windows`/`gt_boxes`. Previously these were created with no device
-        # argument (defaulting to CPU), which works fine on the CPU-only
-        # __main__ sanity test in this file but raises a device-mismatch
-        # RuntimeError the instant this runs on GPU, since trainer.py always
-        # passes in CUDA tensors for windows/gt_boxes during real training.
         device = windows.device
 
-        matched_labels  = torch.zeros(na, dtype=torch.long, device=device)
-        matched_offsets = torch.zeros(na, 2, dtype=torch.float32, device=device)
-        assigned_gt     = torch.full((na,), -1, dtype=torch.long, device=device)
+        matched_labels = torch.zeros(na, dtype=torch.long, device=device)
+        assigned_gt    = torch.full((na,), -1, dtype=torch.long, device=device)
 
         if nb == 0:
-            return (matched_labels, matched_offsets,
-                    torch.zeros(na, dtype=torch.bool, device=device))
+            return (matched_labels, torch.zeros(na, dtype=torch.bool, device=device))
 
         # Build IOU matrix  M ∈ R^{na × nb}
-        M = iou_matrix(windows, gt_boxes)    # (na, nb)  -- now on `device`
+        M = iou_matrix(windows, gt_boxes)    # (na, nb)
         M_work = M.clone()
 
         # ---- Step 1: guarantee every GT box gets its best window ----
@@ -287,14 +225,8 @@ class WindowMatcher:
             M_work[:, j] = -1       # discard column
 
         # ---- Step 2: match remaining windows by threshold (vectorized) ----
-        # FIX: previously this was `for i in range(na): ... .item()`, a
-        # Python loop over every anchor (na can be hundreds) with a
-        # GPU->CPU sync on every iteration. Called once per sample per
-        # batch, this is exactly what pegs the CPU at 100% while the GPUs
-        # sit idle. Replaced with vectorized tensor ops computed once for
-        # all anchors at the same time, with zero per-anchor host syncs.
         unassigned = assigned_gt < 0
-        best_iou, best_j = M.max(dim=1)            # (na,), (na,) -- one shot, no loop
+        best_iou, best_j = M.max(dim=1)
 
         take_pos = unassigned & (best_iou >= self.pos_iou_thresh)
         take_ignore = (unassigned
@@ -306,19 +238,13 @@ class WindowMatcher:
             take_ignore, torch.full_like(assigned_gt, -2), assigned_gt
         )
 
-        # ---- Step 3: encode labels and offsets (vectorized) ----
-        # FIX: same problem as Step 2 -- replaced the per-anchor Python loop
-        # (and its `.item()` call on every iteration) with a single gather
-        # over just the positive windows. If there are zero positives,
-        # pos_idx is simply an empty tensor and every op below becomes a
-        # cheap no-op -- no Python-level branching or host sync needed.
+        # ---- Step 3: assign labels only (no offset encoding) ----
         pos_mask = assigned_gt >= 0
         pos_idx  = pos_mask.nonzero(as_tuple=True)[0]
         j_idx    = assigned_gt[pos_idx]
-        matched_labels[pos_idx]  = gt_labels[j_idx]
-        matched_offsets[pos_idx] = offset_encode(windows[pos_idx], gt_boxes[j_idx])
+        matched_labels[pos_idx] = gt_labels[j_idx]
 
-        return matched_labels, matched_offsets, pos_mask
+        return matched_labels, pos_mask
 
     def hard_negative_mining(self,
                              class_probs: torch.Tensor,
@@ -372,31 +298,15 @@ if __name__ == '__main__':
     gt_labels = torch.tensor([1, 2])
 
     matcher = WindowMatcher(pos_iou_thresh=0.4)
-    lbl, off, pos = matcher.match(gen.windows, gt_boxes, gt_labels)
+    lbl, pos = matcher.match(gen.windows, gt_boxes, gt_labels)
 
     print(f'Positive windows  : {pos.sum().item()}')
     print(f'Background windows: {(lbl == 0).sum().item()}')
 
-    # Test encode → decode round-trip
-    pos_idx = pos.nonzero(as_tuple=True)[0]
-    if len(pos_idx):
-        w = gen.windows[pos_idx]
-        o = off[pos_idx]
-        recovered = offset_decode(w, o)
-        # NOTE (pre-existing, unrelated to device fix): this line previously read
-        # `gt_boxes[gt_labels[lbl[pos_idx]] - 1]`, double-indexing through
-        # gt_labels. Since matched_labels already store the actual GT label
-        # value (1-indexed), the correct lookup is directly into gt_boxes.
-        print('Offset encode→decode round-trip error:',
-              (recovered - gt_boxes[lbl[pos_idx] - 1]).abs().max().item())
-
-    # Device-mismatch regression test: simulate what happens on GPU pipelines
-    # by moving windows/gt_boxes onto a non-default device proxy (here we
-    # just verify dtype/device propagation works for CPU; on a real CUDA
-    # box, re-run this block with .to('cuda') to confirm no RuntimeError).
+    # Device-mismatch regression test
     if torch.cuda.is_available():
         gen_cuda = gen.windows.cuda()
         gt_boxes_cuda = gt_boxes.cuda()
         gt_labels_cuda = gt_labels.cuda()
-        lbl_c, off_c, pos_c = matcher.match(gen_cuda, gt_boxes_cuda, gt_labels_cuda)
+        lbl_c, pos_c = matcher.match(gen_cuda, gt_boxes_cuda, gt_labels_cuda)
         print('CUDA match() succeeded, device:', lbl_c.device)
