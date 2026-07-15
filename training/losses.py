@@ -13,8 +13,14 @@ Components
 
 3. MTHARSLoss
    – Eq. (8): combined multi-task loss
-        L = (1/N) * (α * L_conf + β * L_loc)
-   where N = number of matched (positive) windows in the batch.
+        L = α * (L_conf / N_conf) + β * (L_loc / N_loc)
+   where N_conf = positives + hard negatives (per task)
+         N_loc  = positives × 2 offset dims (per task)
+   
+   IMPORTANT (Section 4.C): Each task is normalized by its own term count,
+   not by the shared positive count N. This makes alpha/beta true independent
+   weights and removes the dataset/density-dependent rescaling that occurred
+   when a single N normalized both ~4N classification terms and ~2N localization terms.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ class SmoothL1Loss1D(nn.Module):
     Smooth-L1 loss for the offset regression branch.
 
     SmoothL1(x) = 0.5 * x²   if |x| < 1
-                  |x| - 0.5  otherwise
+                   |x| - 0.5  otherwise
 
     Applied only to *positive* windows (those matched to a GT box).
     """
@@ -51,7 +57,7 @@ class SmoothL1Loss1D(nn.Module):
             pos_mask     : (B, na)     bool, True for positive windows
 
         Returns:
-            scalar loss sum
+            scalar loss sum (unnormalized, will be normalized by MTHARSLoss)
         """
         if pos_mask.sum() == 0:
             return pred_offsets.sum() * 0.0   # zero gradient, keep graph
@@ -64,10 +70,7 @@ class SmoothL1Loss1D(nn.Module):
                             0.5 * diff ** 2,
                             diff - 0.5)
         
-        # CHANGED: Switched from loss.sum(dim=1).mean() to loss.sum()
-        # WHY: The sub-losses must return an un-normalized, absolute cumulative sum. 
-        # Dividing by N here causes an accidental double-normalization inside MTHARSLoss,
-        # which heavily suppresses localization gradients.
+        # Return unnormalized sum (caller handles normalization)
         return loss.sum()
 
 
@@ -87,12 +90,16 @@ class ClassificationLoss(nn.Module):
     def forward(self,
                 cls_logits:     torch.Tensor,
                 matched_labels: torch.Tensor,
-                pos_mask:       torch.Tensor) -> torch.Tensor:
+                pos_mask:       torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
         Args:
             cls_logits     : (B, na, K+1)  raw logits
             matched_labels : (B, na)       int labels
             pos_mask       : (B, na)       bool
+        
+        Returns:
+            loss_sum : scalar (unnormalized)
+            n_terms  : int, count of terms in loss (positives + hard negatives)
         """
         B, na, K_plus_1 = cls_logits.shape
 
@@ -113,9 +120,9 @@ class ClassificationLoss(nn.Module):
 
         # ---- Positive loss ----
         pos_loss = F.cross_entropy(logits[pos], labels[pos], reduction='sum')
+        n_pos = pos.sum().item()
 
         # ---- Hard-negative mining ----
-        n_pos = pos.sum().item()
         n_neg_target = min(int(n_pos * self.n_neg_ratio),
                            int((~pos).sum().item()))
 
@@ -138,14 +145,30 @@ class ClassificationLoss(nn.Module):
             neg_loss = F.cross_entropy(hard_neg_logits, hard_neg_labels,
                                        reduction='sum')
 
-        return pos_loss + neg_loss
+        # Return unnormalized sum and term count for caller to normalize
+        return pos_loss + neg_loss, n_pos + n_neg_target
+
+
 # ---------------------------------------------------------------------------
-# Combined Multi-Task Loss  (Equation 8)
+# Combined Multi-Task Loss  (Equation 8 — CORRECTED per Section 4.C)
 # ---------------------------------------------------------------------------
 
 class MTHARSLoss(nn.Module):
     """
-    L = (1/N) * (α * L_conf + β * L_loc)
+    CORRECTED Multi-Task Loss (Section 4.C of the engineering guide).
+    
+    Old formula (problematic):
+        L = (1/N) * (α * L_conf_sum + β * L_loc_sum)
+    
+    where N = positive count only. This silently rescaled α:β based on
+    match density because L_conf_sum ≈ 4N terms (positives + 3 hard negs)
+    while L_loc_sum ≈ 2N terms (positives × 2 offset dims).
+    
+    New formula (correct):
+        L = α * (L_conf_sum / (N_pos + N_neg)) + β * (L_loc_sum / N_pos)
+    
+    Each task is normalized by its actual term count, making α/β true
+    independent weights that don't drift with dataset match density.
 
     Args:
         n_classes   : K (number of activity classes, excluding background).
@@ -156,6 +179,9 @@ class MTHARSLoss(nn.Module):
     Best settings found in ablation (Table VII of the paper):
         WISDM       → α=2, β=3  (F1=0.9881)
         OPPORTUNITY → α=1, β=1  (F1=0.9213)
+    
+    NOTE: With corrected normalization, these may need re-derivation across
+    datasets, but will be more stable once found (won't drift per dataset).
     """
 
     def __init__(self,
@@ -187,28 +213,29 @@ class MTHARSLoss(nn.Module):
         Returns:
             total_loss : scalar
             stats      : dict with 'conf_loss', 'loc_loss', 'total_loss',
-                         'n_pos' for logging.
+                         'n_pos', 'n_neg' for logging.
         """
-        # CHANGED: Internal calculations now capture raw, absolute loss sums
-        L_conf_sum = self.conf_loss(cls_logits, matched_labels, pos_mask)
+        # Compute raw, unnormalized loss sums and term counts
+        L_conf_sum, N_conf = self.conf_loss(cls_logits, matched_labels, pos_mask)
         L_loc_sum  = self.loc_loss(pred_offsets, true_offsets, pos_mask)
-
-        N   = max(pos_mask.sum().item(), 1)
+        N_loc      = max(pos_mask.sum().item(), 1)  # positives × 2 dims, but we normalize the sum
         
-        # CHANGED: Rewrote the total formula calculation
-        # WHY: This perfectly implements Equation 8 from the paper: L = (1/N) * (alpha * L_conf + beta * L_loc).
-        # Since the sub-losses now return absolute sums, alpha and beta scale their respective tasks uniformly
-        # before a single division by N occurs.
-        total = (self.alpha * L_conf_sum + self.beta * L_loc_sum) / N
+        # CORRECTED: Independent normalization per task (Section 4.C)
+        # Classification: normalize by (positives + hard negatives)
+        conf_term = (self.alpha * L_conf_sum / max(N_conf, 1))
+        # Localization: normalize by positives
+        loc_term  = (self.beta * L_loc_sum / max(N_loc, 1))
+        
+        # Combined loss
+        total = conf_term + loc_term
 
-        # CHANGED: Adjusted statistics dictionary calculation mapping
-        # WHY: Since sub-losses return raw sums, we track metrics by scaling them back by N 
-        # so that your tracking, validation charts, and terminal prints reflect accurate mean behaviors.
+        # CORRECTED: Adjusted statistics to reflect actual mean behaviors
         stats = {
-            'conf_loss':  (L_conf_sum / N).item(),
-            'loc_loss':   (L_loc_sum / N).item(),
+            'conf_loss':  (L_conf_sum / max(N_conf, 1)).item(),
+            'loc_loss':   (L_loc_sum / max(N_loc, 1)).item(),
             'total_loss': total.item(),
-            'n_pos':      int(N),
+            'n_pos':      int(N_loc),
+            'n_neg':      int(N_conf - N_loc),  # hard negatives
         }
         return total, stats
 
@@ -283,6 +310,7 @@ if __name__ == '__main__':
     print(f'  conf     : {stats["conf_loss"]:.4f}')
     print(f'  loc      : {stats["loc_loss"]:.4f}')
     print(f'  n_pos    : {stats["n_pos"]}')
+    print(f'  n_neg    : {stats["n_neg"]}')
 
     # F1 test
     f1 = WeightedF1(n_classes=K)
