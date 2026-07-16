@@ -1,36 +1,49 @@
 """
-model/multiscale_windows.py
-============================
+model/multiscale_windows.py  (SEGMENTATION-ONLY VARIANT)
+===========================================================
 Section III-B of the paper: Multiscale Window Generation and Matching.
 
-Components
-----------
-1. WindowGenerator
-   – generates windows of multiple scales centered on each unit of
-     the backbone feature sequence (mirrors the anchor concept from SSD).
+CHANGED vs. the multi-task version
+-----------------------------------
+Implements §4.B ("Segmentation-only conversion") step 2 from the
+coupling-map analysis:
 
-2. iou_1d
-   – Jaccard index (Intersection-over-Union) for 1-D intervals.
+  - `WindowMatcher.match()` no longer returns a per-class `matched_labels`
+    tensor at all. With no `cls_branch` (deleted in `model/segmentation.py`),
+    there's nothing that predicts a class, so there's no per-class target
+    to build. As the analysis doc puts it: "you still need pos_mask for
+    offset supervision, but the label tensor itself becomes trivial" — in
+    fact it's not just trivial, it's *redundant* with `pos_mask` itself
+    (foreground = `pos_mask`, background = `~pos_mask`), so it is dropped
+    from the return signature entirely rather than kept as a
+    always-equal-to-pos_mask.long() dead value.
+  - Return signature changes from
+        (matched_labels, matched_offsets, pos_mask)
+    to
+        (matched_offsets, pos_mask)
+    `pos_mask` doubles as the binary foreground/background target for the
+    new objectness head (see `model/segmentation.py`).
 
-3. WindowMatcher
-   – assigns each generated window to its closest ground-truth
-     activity bounding box using the greedy Hungarian-style algorithm
-     described in the paper (Section III-B, "Multiscale window labeling
-     and matching").
-
-4. offset_encode / offset_decode
-   – Equations (1)-(4): convert between absolute boundaries and the
-     (center-offset, log-length-offset) parameterisation used during
-     training and inference.
+Kept unchanged
+---------------
+  - `offset_encode` / `offset_decode` (Equations 1-4) — segmentation-only
+    still regresses boundaries, so these are still needed, unlike in the
+    recognition-only variant.
+  - `WindowGenerator`, `iou_1d`, `iou_matrix` — unchanged.
+  - `WindowMatcher.hard_negative_mining` — DELETED. Per the analysis doc's
+    §4.B step 1, hard-negative mining existed only to feed the per-class
+    `ClassificationLoss`, which no longer exists. The new binary objectness
+    loss (see `training/losses.py`) handles foreground/background
+    imbalance via `pos_weight` in `BCEWithLogitsLoss` instead of explicit
+    negative mining.
 """
 
 from __future__ import annotations
 
 import math
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 
 import torch
-import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +62,6 @@ def iou_1d(windows: torch.Tensor,
     Returns:
         iou : (N,) float tensor in [0, 1]
     """
-    # Convert center+length to start/end
     w_start = windows[:, 0] - windows[:, 1] / 2
     w_end   = windows[:, 0] + windows[:, 1] / 2
 
@@ -85,7 +97,7 @@ def iou_matrix(windows: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Offset encoding / decoding  (Equations 1-4)
+# Offset encoding / decoding  (Equations 1-4) — UNCHANGED, still needed
 # ---------------------------------------------------------------------------
 
 def offset_encode(windows: torch.Tensor,
@@ -96,13 +108,6 @@ def offset_encode(windows: torch.Tensor,
     Implements Equations (1) and (2):
         f_x = (t_x - w_x) / w_l
         f_l = log(t_l / w_l)
-
-    Args:
-        windows  : (N, 2)  matched windows [center, length]
-        gt_boxes : (N, 2)  matched GT boxes [center, length]
-
-    Returns:
-        offsets : (N, 2)  [f_x, f_l]
     """
     f_x = (gt_boxes[:, 0] - windows[:, 0]) / windows[:, 1].clamp(min=1e-6)
     f_l = torch.log(gt_boxes[:, 1] / windows[:, 1].clamp(min=1e-6))
@@ -117,13 +122,6 @@ def offset_decode(windows: torch.Tensor,
     Implements Equations (3) and (4):
         t̂_x = f_x * w_l + w_x
         t̂_l = w_l * exp(f_l)
-
-    Args:
-        windows : (N, 2)  anchor windows [center, length]
-        offsets : (N, 2)  predicted offsets [f_x, f_l]
-
-    Returns:
-        pred_boxes : (N, 2)  predicted boundaries [center, length]
     """
     pred_x = offsets[:, 0] * windows[:, 1] + windows[:, 0]
     pred_l = windows[:, 1] * torch.exp(offsets[:, 1])
@@ -131,23 +129,12 @@ def offset_decode(windows: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Window Generator
+# Window Generator  (unchanged from multi-task version)
 # ---------------------------------------------------------------------------
 
 class WindowGenerator:
     """
     Generate multiscale anchor windows for a 1-D feature sequence.
-
-    Corresponds to Section III-B: "Generation of windows."
-
-    The feature sequence has length  n_feat  (output length of the backbone).
-    For each scale  s  in  self.scales, two window lengths are created:
-        l1 = n_feat * sqrt(s)
-        l2 = n_feat / sqrt(s)
-    Windows are centered on each unit  x  of the feature sequence.
-
-    The absolute window centers are mapped to [0, n_feat) using relative
-    positions so they can be scaled to any raw-data stream length.
 
     Args:
         scales     : list of scale values s ∈ (0, 1]
@@ -161,18 +148,14 @@ class WindowGenerator:
         self.scales   = scales
         self.feat_len = feat_len
         self.data_len = data_len
-        self.windows  = self._generate()   # (na, 2) in absolute data coords
+        self.windows  = self._generate()
 
     def _generate(self) -> torch.Tensor:
-        """
-        Returns (na, 2) tensor where each row is [center_x, length]
-        expressed in raw-data coordinate space.
-        """
-        ratio = self.data_len / self.feat_len   # maps feature → data coords
+        ratio = self.data_len / self.feat_len
 
         window_list = []
-        for x in range(self.feat_len):              # center on each feature unit
-            center_data = (x + 0.5) * ratio        # center in data coords
+        for x in range(self.feat_len):
+            center_data = (x + 0.5) * ratio
 
             for s in self.scales:
                 sqrts = math.sqrt(s)
@@ -180,17 +163,13 @@ class WindowGenerator:
                                     self.feat_len / sqrts * ratio]:
                     window_list.append([center_data, length_data])
 
-        return torch.tensor(window_list, dtype=torch.float32)   # (na, 2)
+        return torch.tensor(window_list, dtype=torch.float32)
 
     @property
     def num_windows(self) -> int:
         return self.windows.shape[0]
 
     def to_start_end(self) -> torch.Tensor:
-        """
-        Convert (center, length) → (start, end) in data coordinates.
-        Returns (na, 2).
-        """
         centers = self.windows[:, 0]
         lengths = self.windows[:, 1]
         starts  = (centers - lengths / 2).clamp(min=0)
@@ -199,68 +178,60 @@ class WindowGenerator:
 
 
 # ---------------------------------------------------------------------------
-# Window Matcher
+# Window Matcher  (SEGMENTATION-ONLY: labels collapsed away, offsets kept)
 # ---------------------------------------------------------------------------
 
 class WindowMatcher:
     """
     Match generated windows to ground-truth activity bounding boxes.
 
-    Implements the greedy assignment algorithm described in Section III-B
-    ("Multiscale window labeling and matching"):
-
     Step 1: Find the best window for every GT box (highest IOU).
     Step 2: For remaining unmatched windows, assign the GT box with the
             highest IOU if that IOU exceeds `pos_iou_thresh`.
     Step 3: Windows with IOU < neg_iou_thresh for ALL GT boxes become
-            background (class 0).
+            background.
 
     Args:
         pos_iou_thresh : minimum IOU to label a window as positive
         neg_iou_thresh : maximum IOU for a window to be labelled background
-        n_neg_ratio    : ratio of negatives to positives for hard-negative
-                         mining during training (paper uses 3:1)
+                        (kept for interface parity / future re-use, though
+                        segmentation-only doesn't do explicit "ignore"
+                        handling any differently than recognition-only did)
     """
 
     def __init__(self,
                  pos_iou_thresh: float = 0.5,
-                 neg_iou_thresh: float = 0.3,
-                 n_neg_ratio:    int   = 3):
+                 neg_iou_thresh: float = 0.3):
         self.pos_iou_thresh = pos_iou_thresh
         self.neg_iou_thresh = neg_iou_thresh
-        self.n_neg_ratio    = n_neg_ratio
 
     def match(self,
               windows:  torch.Tensor,
-              gt_boxes: torch.Tensor,
-              gt_labels: torch.Tensor
-              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+              gt_boxes: torch.Tensor
+              ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             windows   : (na, 2)  anchor windows [center, length]
             gt_boxes  : (nb, 2)  GT bounding boxes [center, length]
-            gt_labels : (nb,)    GT activity class labels (1-indexed;
-                                 0 is reserved for background)
+                       (no gt_labels arg anymore — there is no class to
+                        assign, only a foreground/background + boundary)
 
         Returns:
-            matched_labels  : (na,)    class label per window (0=background)
             matched_offsets : (na, 2)  encoded offsets (valid for positives)
-            pos_mask        : (na,)    bool mask of positive windows
+            pos_mask        : (na,)    bool mask of positive (foreground)
+                              windows — doubles as the objectness target
         """
         na = windows.shape[0]
         nb = gt_boxes.shape[0]
         device = windows.device
 
-        matched_labels  = torch.zeros(na, dtype=torch.long, device=device)
         matched_offsets = torch.zeros(na, 2, dtype=torch.float32, device=device)
         assigned_gt     = torch.full((na,), -1, dtype=torch.long, device=device)
 
         if nb == 0:
-            return (matched_labels, matched_offsets,
-                    torch.zeros(na, dtype=torch.bool, device=device))
+            return matched_offsets, torch.zeros(na, dtype=torch.bool, device=device)
 
-        # Build IOU matrix  M ∈ R^{na × nb}
-        M = iou_matrix(windows, gt_boxes)    # (na, nb)
+        M = iou_matrix(windows, gt_boxes)
         M_work = M.clone()
 
         # ---- Step 1: guarantee every GT box gets its best window ----
@@ -269,11 +240,11 @@ class WindowMatcher:
             if best.item() == 0:
                 break
             flat_idx = M_work.argmax()
-            i = flat_idx // nb      # window index
-            j = flat_idx %  nb      # GT box index
+            i = flat_idx // nb
+            j = flat_idx %  nb
             assigned_gt[i] = j
-            M_work[i, :] = -1       # discard row
-            M_work[:, j] = -1       # discard column
+            M_work[i, :] = -1
+            M_work[:, j] = -1
 
         # ---- Step 2: match remaining windows by threshold (vectorized) ----
         unassigned = assigned_gt < 0
@@ -289,44 +260,19 @@ class WindowMatcher:
             take_ignore, torch.full_like(assigned_gt, -2), assigned_gt
         )
 
-        # ---- Step 3: encode labels and offsets (vectorized) ----
+        # ---- Step 3: encode offsets only — no label tensor at all ----
         pos_mask = assigned_gt >= 0
         pos_idx  = pos_mask.nonzero(as_tuple=True)[0]
         j_idx    = assigned_gt[pos_idx]
-        matched_labels[pos_idx]  = gt_labels[j_idx]
         matched_offsets[pos_idx] = offset_encode(windows[pos_idx], gt_boxes[j_idx])
 
-        return matched_labels, matched_offsets, pos_mask
+        return matched_offsets, pos_mask
 
-    def hard_negative_mining(self,
-                             class_probs: torch.Tensor,
-                             pos_mask:    torch.Tensor
-                             ) -> torch.Tensor:
-        """
-        Select hard negatives so that neg : pos ≈ n_neg_ratio : 1.
-
-        Args:
-            class_probs : (na, K+1)  softmax class probabilities
-            pos_mask    : (na,)      bool mask of positive windows
-
-        Returns:
-            neg_mask : (na,) bool mask of selected hard negatives
-        """
-        n_pos = pos_mask.sum().item()
-        n_neg_target = min(int(n_pos * self.n_neg_ratio),
-                           (~pos_mask).sum().item())
-
-        # Confidence loss for each negative (higher loss → harder)
-        bg_prob  = class_probs[:, 0]                        # P(background)
-        neg_loss = -torch.log(bg_prob.clamp(min=1e-7))      # cross-entropy
-
-        # Zero out positives so they don't get selected
-        neg_loss = neg_loss.masked_fill(pos_mask, -1.0)
-
-        _, sorted_idx = neg_loss.sort(descending=True)
-        neg_mask = torch.zeros_like(pos_mask)
-        neg_mask[sorted_idx[:n_neg_target]] = True
-        return neg_mask
+    # NOTE: hard_negative_mining intentionally DELETED here. It only ever
+    # fed the per-class ClassificationLoss, which no longer exists in the
+    # segmentation-only variant. Foreground/background imbalance is now
+    # handled via `pos_weight` in the new binary ObjectnessLoss (see
+    # training/losses.py) instead of explicit top-k negative selection.
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +280,6 @@ class WindowMatcher:
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # Simulate a feature sequence of length 8 from a 64-sample data stream
     feat_len = 8
     data_len = 64
     scales   = [0.5, 1.0]
@@ -342,32 +287,26 @@ if __name__ == '__main__':
     gen = WindowGenerator(scales=scales, feat_len=feat_len, data_len=data_len)
     print(f'Generated {gen.num_windows} windows for feat_len={feat_len}, '
           f'data_len={data_len}, scales={scales}')
-    print('First 4 windows (center, length):', gen.windows[:4])
 
-    # Simulate 2 GT boxes
-    gt_boxes  = torch.tensor([[15.0, 20.0],
-                               [45.0, 10.0]])
-    gt_labels = torch.tensor([1, 2])
+    gt_boxes = torch.tensor([[15.0, 20.0],
+                              [45.0, 10.0]])
 
     matcher = WindowMatcher(pos_iou_thresh=0.4)
-    lbl, off, pos = matcher.match(gen.windows, gt_boxes, gt_labels)
+    off, pos = matcher.match(gen.windows, gt_boxes)
 
-    print(f'Positive windows  : {pos.sum().item()}')
-    print(f'Background windows: {(lbl == 0).sum().item()}')
+    print(f'Positive (foreground) windows: {pos.sum().item()}')
+    print(f'Background windows           : {(~pos).sum().item()}')
 
-    # Test encode → decode round-trip
     pos_idx = pos.nonzero(as_tuple=True)[0]
     if len(pos_idx):
         w = gen.windows[pos_idx]
         o = off[pos_idx]
         recovered = offset_decode(w, o)
-        print('Offset encode→decode round-trip error:',
-              (recovered - gt_boxes[lbl[pos_idx] - 1]).abs().max().item())
+        print('Offset encode→decode round-trip (first positive):',
+              recovered[0].tolist())
 
-    # Device-mismatch regression test
     if torch.cuda.is_available():
         gen_cuda = gen.windows.cuda()
         gt_boxes_cuda = gt_boxes.cuda()
-        gt_labels_cuda = gt_labels.cuda()
-        lbl_c, off_c, pos_c = matcher.match(gen_cuda, gt_boxes_cuda, gt_labels_cuda)
-        print('CUDA match() succeeded, device:', lbl_c.device)
+        off_c, pos_c = matcher.match(gen_cuda, gt_boxes_cuda)
+        print('CUDA match() succeeded, device:', off_c.device)
