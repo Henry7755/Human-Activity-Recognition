@@ -1,19 +1,64 @@
 """
-training/trainer.py
-====================
-Training, evaluation, and empirical monitoring loop for MTHARS.
+training/trainer.py  (SEGMENTATION-ONLY VARIANT)
+==================================================
+Training, evaluation, and empirical monitoring loop for the
+segmentation-only model (MTHARSSegmentation).
 
-Covers:
-    - Section III-E  : Training Model
-    - Section IV-C   : Static Sliding-Window Segmentation experiments
-    - Section IV-D   : Dynamic Segmentation experiments
-    - Section IV-E   : Activity Recognition experiments
-    - Section IV-F   : Ablation experiments (α/β weights, scale s)
-    
-GPU SUPPORT:
-    - Multi-GPU training via torch.nn.DataParallel
-    - Mixed precision (AMP) for faster training
-    - Non-blocking data transfer for optimal GPU utilization
+CHANGED vs. the multi-task version
+-----------------------------------
+Implements the remaining §4.B steps against `trainer.py`:
+
+  - `prepare_targets`: `WindowMatcher.match()` no longer takes `gt_labels`
+    and returns 2 values (`matched_offsets`, `pos_mask`) instead of 3 — no
+    `all_labels` buffer.
+  - `train_epoch`: `model(batch_x)` now returns `(pred_offsets, obj_logits)`
+    instead of `(cls_logits, offsets)`. `criterion(...)` is called with
+    `(pred_offsets, obj_logits, true_offsets, pos_mask)`, matching
+    `SegmentationLoss.forward`'s new signature. `total_stats` drops
+    `conf_loss`, adds `obj_loss`.
+  - `evaluate` — REWRITTEN, and flagged explicitly:
+
+      The coupling-map analysis (§4.B step 6) says to "wire
+      SegmentationEvaluator (NED) into trainer.py's eval loop." Taken
+      literally, that doesn't transfer cleanly: NED (Eq. 9/10) is defined
+      as an edit distance between two *class-label* sequences — but a
+      segmentation-only model has no classification branch left to
+      produce a label sequence from, only a foreground/background span.
+      Comparing a "no class" prediction sequence against a multi-class
+      ground truth via edit distance isn't well-defined without inventing
+      semantics the paper doesn't specify.
+
+      This file instead evaluates segmentation quality the way it's
+      actually measurable given what the model outputs: frame-level
+      foreground/background IoU (Jaccard index) between the predicted
+      foreground mask (rendered from `MTHARSSegmentation.predict()` +
+      `ConcatenateAlgorithm`) and the true foreground mask. ASSUMPTION,
+      flagged: this treats raw label `0` in the dataset as a
+      "null/no-activity" background class (the same convention already
+      implicit in `prepare_targets`' `s['label'] + 1` 1-indexing scheme,
+      and consistent with common HAR segmentation benchmarks like
+      OPPORTUNITY/SKODA's "null" class). If your dataset doesn't reserve
+      label 0 for background, adjust `_true_foreground_mask` below.
+
+      If you have the project's real `evaluation/metrics.py`, wiring its
+      actual `SegmentationEvaluator`/NED implementation in place of the
+      frame-IoU evaluator below is straightforward — swap the import and
+      the two calls inside `evaluate()`. I don't have that file's content,
+      so this is a self-contained substitute rather than a guess at its
+      internals.
+
+  - `Trainer.__init__`: instantiates `MTHARSSegmentation` (not `MTHARS`,
+    no `n_classes` arg) and `SegmentationLoss` (not `MTHARSLoss`); drops
+    `cfg.alpha`, adds `cfg.gamma`/`cfg.pos_weight`.
+  - CLI (`parse_args`): `--alpha` removed, `--gamma` and `--pos_weight`
+    added. `--beta` kept (still weights the localisation term).
+  - `run_ablation_study`: the α/β sweep (Table VII) is replaced with a
+    β/γ/pos_weight-aware analogue, since α/L_conf no longer exists.
+  - `generate_report_image`: plots `loc_loss`/`obj_loss` instead of
+    `conf_loss`/`loc_loss`; the accuracy/F1 panel is replaced with mean
+    foreground IoU.
+
+GPU SUPPORT: unchanged (multi-GPU DataParallel, AMP, non-blocking transfer).
 """
 
 from __future__ import annotations
@@ -40,35 +85,27 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backbone.sknet import SKNet1D
 from datasets.har_datasets import load_dataset, get_dataloaders, DATASET_INFO
-from model.recognition_segmentation import MTHARS, ConcatenateAlgorithm
-from model.multiscale_windows import WindowGenerator, WindowMatcher, offset_encode
-from training.losses import MTHARSLoss, WeightedF1
+from model.segmentation import MTHARSSegmentation, ConcatenateAlgorithm
+from model.multiscale_windows import WindowGenerator, WindowMatcher
+from training.losses import SegmentationLoss
 
 
 # ---------------------------------------------------------------------------
-# GPU Utilities
+# GPU Utilities  (unchanged)
 # ---------------------------------------------------------------------------
 
 def get_multi_gpu_device() -> Tuple[torch.device, int]:
-    """
-    Detect available GPUs and set optimal device strategy.
-    
-    Returns:
-        device: torch.device ('cuda:0' if GPU available, else 'cpu')
-        num_gpus: int (number of GPUs detected)
-    """
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
         print(f"\n{'='*80}")
         print(f"  🎯 GPU ACCELERATION ENABLED")
         print(f"{'='*80}")
         print(f"  ✓ Found {num_gpus} GPU(s) available")
-        
-        # Print GPU details
+
         for i in range(num_gpus):
             props = torch.cuda.get_device_properties(i)
             print(f"    GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB)")
-        
+
         device = torch.device('cuda:0')
         print(f"  ✓ Primary device: {device}\n")
         return device, num_gpus
@@ -89,22 +126,23 @@ def get_device() -> torch.device:
 
 
 # ---------------------------------------------------------------------------
-# Ground-truth preparation  (window → matched labels + offsets)
+# Ground-truth preparation  (window → matched offsets + positive mask)
 # ---------------------------------------------------------------------------
 
 def prepare_targets(window_gen: WindowGenerator,
                     matcher:    WindowMatcher,
                     gt_segments: List[List[Dict]],
                     device:      torch.device
-                    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Convert a batch of GT segment lists into per-window labels, offsets,
-    and positive masks, ready for the loss computation.
+    Convert a batch of GT segment lists into per-window offsets and
+    positive masks. CHANGED: no `gt_labels` passed to `matcher.match()`
+    anymore, and no `all_labels` buffer returned — segmentation-only
+    doesn't classify.
     """
     B  = len(gt_segments)
     na = window_gen.num_windows
 
-    all_labels  = torch.zeros(B, na, dtype=torch.long)
     all_offsets = torch.zeros(B, na, 2, dtype=torch.float32)
     all_pos     = torch.zeros(B, na, dtype=torch.bool)
 
@@ -115,99 +153,100 @@ def prepare_targets(window_gen: WindowGenerator,
             continue
 
         gt_boxes = []
-        gt_lbl   = []
         for s in segs:
             cx = (s['start'] + s['end']) / 2.0
             ln = float(s['end'] - s['start'] + 1)
             gt_boxes.append([cx, ln])
-            gt_lbl.append(s['label'] + 1)   # 1-indexed (0=background)
+        # NOTE: no gt_lbl list built here — segmentation-only never needs
+        # a class id, only the box itself.
 
-        gt_boxes_t  = torch.tensor(gt_boxes,  dtype=torch.float32, device=device)
-        gt_labels_t = torch.tensor(gt_lbl,    dtype=torch.long, device=device)
+        gt_boxes_t = torch.tensor(gt_boxes, dtype=torch.float32, device=device)
 
-        lbl, off, pos = matcher.match(anchors, gt_boxes_t, gt_labels_t)
-        all_labels[b]  = lbl.cpu()
+        off, pos = matcher.match(anchors, gt_boxes_t)
         all_offsets[b] = off.cpu()
         all_pos[b]     = pos.cpu()
 
-    return (all_labels.to(device),
-            all_offsets.to(device),
-            all_pos.to(device))
+    return all_offsets.to(device), all_pos.to(device)
+
+
+# ---------------------------------------------------------------------------
+# GT segment extraction  (shared helper — same transition-tracing logic as
+# the multi-task/recognition-only trainer, but 'label' is only used
+# internally to find segment boundaries, never propagated to the matcher)
+# ---------------------------------------------------------------------------
+
+def _extract_gt_segments(batch_y: torch.Tensor, T: int) -> List[List[Dict]]:
+    """
+    Args:
+        batch_y : (B, T) frame-level labels, or (B,) whole-clip labels
+        T       : window length
+
+    Returns:
+        list of per-sample GT segment lists: [{'start', 'end', 'label'}]
+        ('label' is kept in the dict for foreground-mask evaluation later,
+        but `prepare_targets` above ignores it when building matcher input)
+    """
+    B = batch_y.shape[0]
+    gt_segs = []
+
+    for i in range(B):
+        if batch_y.dim() > 1:
+            seq = batch_y[i].cpu().numpy()
+            diffs = np.diff(seq, prepend=-1)
+            starts = np.where(diffs != 0)[0]
+            ends = np.append(starts[1:] - 1, seq.shape[0] - 1)
+
+            sample_segs = []
+            for s, e in zip(starts, ends):
+                if seq[s] != -1:
+                    sample_segs.append({
+                        'start': int(s),
+                        'end': int(e),
+                        'label': int(seq[s])
+                    })
+
+            if len(sample_segs) == 0:
+                sample_segs.append({'start': 0, 'end': T - 1, 'label': 0})
+            gt_segs.append(sample_segs)
+        else:
+            lbl = batch_y[i].item()
+            gt_segs.append([
+                {'start': 0, 'end': T - 1, 'label': lbl},
+                {'start': T // 4, 'end': (3 * T) // 4, 'label': lbl}
+            ])
+
+    return gt_segs
+
 
 # ---------------------------------------------------------------------------
 # Training epoch
 # ---------------------------------------------------------------------------
 
-def train_epoch(model:       MTHARS,
+def train_epoch(model:       MTHARSSegmentation,
                 loader:      DataLoader,
                 optimizer:   optim.Optimizer,
-                criterion:   MTHARSLoss,
+                criterion:   SegmentationLoss,
                 window_gen:  WindowGenerator,
                 matcher:     WindowMatcher,
                 device:      torch.device,
                 scaler:      Optional[GradScaler] = None,
                 max_norm:    float = 1.0
                 ) -> Dict[str, float]:
-    """
-    Run one training epoch with enforced stable gradient step limitations.
-    Supports both single-GPU and multi-GPU training.
-    """
+    """Run one training epoch. Supports both single-GPU and multi-GPU."""
     model.train()
     total_stats: Dict[str, float] = {
-        'conf_loss': 0.0, 'loc_loss': 0.0,
-        'total_loss': 0.0, 'n_pos': 0.0
+        'loc_loss': 0.0, 'obj_loss': 0.0, 'total_loss': 0.0, 'n_pos': 0.0
     }
     n_batches = 0
 
     for batch_x, batch_y in loader:
-        # Non-blocking transfer for better GPU utilization
         batch_x = batch_x.to(device, non_blocking=True)   # (B, C, T)
         batch_y = batch_y.to(device, non_blocking=True)   # (B, T) or (B,)
-        B       = batch_x.shape[0]
         T       = batch_x.shape[2]
 
-        # ---- NEW FIX: DYNAMIC TARGET ENGINEERING ----
-        # CHANGED: Replaced static window assignment with a conditional tensor check.
-        # WHY: When using sequence-labeled datasets like SKODA, batch_y has shape [B, T]. 
-        # We must extract the actual frame boundaries of the activity segments so that 
-        # multi-scale anchors have valid boxes to match against, preventing anchor starvation (N=0).
-        gt_segs = []
-        for i in range(B):
-            if batch_y.dim() > 1:
-                # Sequence Mode (e.g., SKODA / OPPORTUNITY frame-level annotations)
-                seq = batch_y[i].cpu().numpy()
-                
-                # Trace continuous segments where activity values switch
-                diffs = np.diff(seq, prepend=-1)
-                starts = np.where(diffs != 0)[0]
-                ends = np.append(starts[1:] - 1, seq.shape[0] - 1)
-                
-                sample_segs = []
-                for s, e in zip(starts, ends):
-                    if seq[s] != -1:  # Drop background/ignore padding elements if present
-                        sample_segs.append({
-                            'start': int(s), 
-                            'end': int(e), 
-                            'label': int(seq[s])
-                        })
-                
-                # Safeguard: if parsing returns nothing, fall back to the full window
-                if len(sample_segs) == 0:
-                    sample_segs.append({'start': 0, 'end': T - 1, 'label': 0})
-                gt_segs.append(sample_segs)
-            else:
-                # Legacy / Global Label Mode (Single label per window [B])
-                # WHY: For datasets providing an overall label, we inject a dual-scale 
-                # target configuration so both wide and highly localized anchors pass 
-                # the IoU matching threshold cleanly.
-                lbl = batch_y[i].item()
-                gt_segs.append([
-                    {'start': 0, 'end': T - 1, 'label': lbl},
-                    {'start': T // 4, 'end': (3 * T) // 4, 'label': lbl}
-                ])
+        gt_segs = _extract_gt_segments(batch_y, T)
 
-        # Pass our dynamically generated segments to your original target matching helper
-        matched_labels, true_offsets, pos_mask = prepare_targets(
+        true_offsets, pos_mask = prepare_targets(
             window_gen, matcher, gt_segs, device
         )
 
@@ -215,19 +254,18 @@ def train_epoch(model:       MTHARS,
 
         if scaler is not None:
             with autocast():
-                cls_logits, pred_offsets = model(batch_x)
-                loss, stats = criterion(cls_logits, pred_offsets,
-                                        matched_labels, true_offsets, pos_mask)
+                pred_offsets, obj_logits = model(batch_x)
+                loss, stats = criterion(pred_offsets, obj_logits,
+                                        true_offsets, pos_mask)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            # Enforced tight gradient boundary to mitigate mixed-precision spikes
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
-            cls_logits, pred_offsets = model(batch_x)
-            loss, stats = criterion(cls_logits, pred_offsets,
-                                    matched_labels, true_offsets, pos_mask)
+            pred_offsets, obj_logits = model(batch_x)
+            loss, stats = criterion(pred_offsets, obj_logits,
+                                    true_offsets, pos_mask)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
             optimizer.step()
@@ -240,52 +278,119 @@ def train_epoch(model:       MTHARS,
 
 
 # ---------------------------------------------------------------------------
-# Evaluation epoch
+# Frame-level foreground IoU  (substitute for the class-based NED metric —
+# see the module docstring for why NED itself doesn't transfer here)
+# ---------------------------------------------------------------------------
+
+def _true_foreground_mask(batch_y: torch.Tensor, T: int) -> torch.Tensor:
+    """
+    ASSUMPTION: raw label 0 means "no activity / null / background" in the
+    dataset's own label space (same convention `_extract_gt_segments` and
+    `prepare_targets` already lean on). Adjust here if your dataset uses a
+    different background convention or has no null class at all.
+
+    Args:
+        batch_y : (B, T) or (B,)
+
+    Returns:
+        mask : (B, T) bool, True where a frame is foreground
+    """
+    if batch_y.dim() > 1:
+        return batch_y != 0
+    # Whole-clip label with no frame annotation: assume the entire clip
+    # is foreground (mirrors the dual-scale synthetic GT box injection
+    # used elsewhere for this label mode).
+    B = batch_y.shape[0]
+    return torch.ones(B, T, dtype=torch.bool, device=batch_y.device)
+
+
+def _pred_foreground_mask(segments: List[Dict], T: int, device) -> torch.Tensor:
+    """Render a single sample's merged segments into a (T,) bool mask."""
+    mask = torch.zeros(T, dtype=torch.bool, device=device)
+    for seg in segments:
+        s = max(0, seg['start'])
+        e = min(T - 1, seg['end'])
+        if e >= s:
+            mask[s:e + 1] = True
+    return mask
+
+
+class SegmentationEvaluator:
+    """
+    Accumulates frame-level foreground IoU across batches.
+
+    This plays the role `evaluation/metrics.py::SegmentationEvaluator`
+    (NED-based) played in the multi-task pipeline, adapted for a model
+    that has no class output — see module docstring for the reasoning.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.intersection = 0
+        self.union = 0
+        self.n_samples = 0
+
+    def update(self, pred_mask: torch.Tensor, true_mask: torch.Tensor):
+        """
+        Args:
+            pred_mask, true_mask : (T,) bool tensors for one sample
+        """
+        inter = (pred_mask & true_mask).sum().item()
+        uni   = (pred_mask | true_mask).sum().item()
+        self.intersection += inter
+        self.union += uni
+        self.n_samples += 1
+
+    def compute(self) -> float:
+        if self.union == 0:
+            return 1.0 if self.intersection == 0 else 0.0
+        return self.intersection / self.union
+
+
+# ---------------------------------------------------------------------------
+# Evaluation epoch  (REWRITTEN: frame-IoU instead of accuracy/F1)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model:      MTHARS,
+def evaluate(model:      MTHARSSegmentation,
              loader:     DataLoader,
              device:     torch.device,
-             n_classes:  int
+             concat:     Optional[ConcatenateAlgorithm] = None,
              ) -> Dict[str, float]:
     """
-    Evaluate recognition accuracy and clean F1 metrics without cross-epoch bleed.
-    Supports both global window labels and frame-by-frame sequence datasets.
+    Evaluate segmentation quality via frame-level foreground IoU.
+
+    CHANGED: this used to report classification accuracy/F1 by discarding
+    the offset output (`cls_logits, _ = model(batch_x)`). There is no
+    classification output left to report on. Instead this runs the full
+    `predict()` → `ConcatenateAlgorithm` pipeline (the same inference path
+    a deployment would use) and scores the resulting foreground spans
+    against ground truth.
     """
     model.eval()
-    f1_meter = WeightedF1(n_classes=n_classes)
-    correct = total = 0
+    if concat is None:
+        concat = ConcatenateAlgorithm()
+
+    evaluator = SegmentationEvaluator()
 
     for batch_x, batch_y in loader:
         batch_x = batch_x.to(device, non_blocking=True)
         batch_y = batch_y.to(device, non_blocking=True)
+        T = batch_x.shape[2]
 
-        cls_logits, _ = model(batch_x)        # (B, na, K+1)
-        
-        # Aggregate across windows, excluding the background class slice
-        agg_logits = cls_logits[:, :, 1:].mean(dim=1)   # (B, K)
-        preds = agg_logits.argmax(dim=1)                 # (B,)
+        raw_segments = model.predict(batch_x)          # list of B lists
+        merged = concat(raw_segments)                  # list of B lists
 
-        # ---- NEW FIX: EVALUATION SEQUENCE REDUCTION ----
-        # CHANGED: Added a dimensions check and consensus reduction step using torch.mode
-        # WHY: On window-level datasets, batch_y is [B]. On sequence datasets like SKODA, 
-        # batch_y is [B, T]. We resolve the target label sequence down to its dominant 
-        # activity class to match the prediction dimensions [B] perfectly without throwing shape errors.
-        if batch_y.dim() > 1:
-            # torch.mode returns a tuple of (values, indices); [0] extracts the values
-            eval_targets = torch.mode(batch_y, dim=1)[0]
-        else:
-            eval_targets = batch_y
+        true_masks = _true_foreground_mask(batch_y, T)  # (B, T)
 
-        # Compute accurate evaluation telemetry
-        correct += (preds == eval_targets).sum().item()
-        total   += eval_targets.shape[0]
-        f1_meter.update(preds.cpu(), eval_targets.cpu())
+        for b in range(batch_x.shape[0]):
+            pred_mask = _pred_foreground_mask(merged[b], T, device)
+            evaluator.update(pred_mask, true_masks[b])
 
     return {
-        'accuracy': correct / max(total, 1),
-        'f1':        f1_meter.compute(),
+        'foreground_iou': evaluator.compute(),
     }
 
 # ---------------------------------------------------------------------------
@@ -294,47 +399,39 @@ def evaluate(model:      MTHARS,
 
 class Trainer:
     """
-    Orchestrates data pipeline, multi-task backbones, tracking telemetry, 
-    and graphical metric reporting execution.
-    
-    Now with multi-GPU support via DataParallel wrapper.
+    Orchestrates data pipeline, segmentation-only backbone, telemetry, and
+    graphical metric reporting execution. Multi-GPU support unchanged.
     """
 
     def __init__(self, cfg: argparse.Namespace, device: torch.device = None, num_gpus: int = None):
-        self.cfg    = cfg
-        
-        # Auto-detect GPU if not provided
+        self.cfg = cfg
+
         if device is None:
             self.device, self.num_gpus = get_multi_gpu_device()
         else:
             self.device = device
-            # FIX: previously `num_gpus or (1 if device.type == 'cuda' else 0)` would
-            # silently collapse to 1 GPU whenever num_gpus wasn't explicitly passed in,
-            # even if 2 GPUs were physically available. Query the real count instead.
             self.num_gpus = num_gpus if num_gpus is not None else torch.cuda.device_count()
 
         set_seed(cfg.seed)
 
         info = DATASET_INFO[cfg.dataset.upper().replace('-', '_')]
-        self.n_classes = info['n_classes']
-        self.window_t  = info['window']       
-        self.freq      = info['freq']
+        # NOTE: n_classes is no longer stored/used for model construction —
+        # kept here only if you want it for logging/reporting.
+        self.window_t = info['window']
+        self.freq     = info['freq']
 
         print(f'Device     : {self.device}')
         print(f'GPUs       : {self.num_gpus}')
-        print(f'Dataset    : {cfg.dataset}  ({self.n_classes} classes)')
+        print(f'Dataset    : {cfg.dataset}  (segmentation-only)')
         print(f'Window     : {self.window_t} samples @ {self.freq} Hz')
 
-        # Run Path Identification System
         run_id = f"opt_{cfg.optimizer}_lr_{cfg.lr}_clip_{cfg.max_norm}_warm_{cfg.warmup_epochs}"
         self.exp_dir = Path(cfg.output_dir) / cfg.dataset / run_id
         self.exp_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Deliverable 1: Isolated Input Configuration Recipe
+
         with open(self.exp_dir / "hparams.json", "w") as f:
             json.dump(vars(cfg), f, indent=4)
 
-        # Deliverable 2: Telemetry Logger Configuration
         self.writer = SummaryWriter(log_dir=str(self.exp_dir / "telemetry"))
 
         # --- Data ---
@@ -342,41 +439,24 @@ class Trainer:
         self.in_channels = X.shape[1]
 
         train_ratio = 0.80 if cfg.dataset.upper() == 'PAMAP2' else 0.70
-        # FIX: same getattr-with-default pattern as use_multi_gpu above —
-        # num_workers is another recently-added flag, default 4 in the CLI,
-        # that a hand-built notebook Namespace likely never set.
         self.train_dl, self.test_dl = get_dataloaders(
             X, y, segs,
             train_ratio=train_ratio,
             batch_size=cfg.batch_size,
             augment=cfg.augment,
-            num_workers=getattr(cfg, 'num_workers', 4),  # Parallel data loading
-            pin_memory=(self.num_gpus > 0),  # Pin memory for GPU transfer
+            num_workers=getattr(cfg, 'num_workers', 4),
+            pin_memory=(self.num_gpus > 0),
         )
         print(f'Train batches: {len(self.train_dl)} | Test batches: {len(self.test_dl)}')
 
-        # --- Model ---
-        self.model = MTHARS(
+        # --- Model (segmentation-only, no n_classes) ---
+        self.model = MTHARSSegmentation(
             in_channels=self.in_channels,
-            n_classes=self.n_classes,
             scales=cfg.scales,
             feat_dim=cfg.feat_dim,
             data_len=self.window_t,
         ).to(self.device)
 
-        # ── MULTI-GPU WRAPPER ───────────────────────────────────────────────────
-        # Wrap model for multi-GPU training if available.
-        # FIX: previously this only checked `self.num_gpus > 1` and ignored
-        # cfg.use_multi_gpu entirely, making that CLI flag dead/no-op. Now it
-        # actually gates on the flag, so --use_multi_gpu (or its default) controls
-        # whether DataParallel is used.
-        # FIX: use getattr with a default instead of cfg.use_multi_gpu directly.
-        # In notebook environments (Kaggle/Colab) people often build `cfg` by
-        # hand as argparse.Namespace(...) instead of going through parse_args(),
-        # which means any flag they didn't explicitly set (like use_multi_gpu)
-        # simply doesn't exist on the object yet, and a direct attribute access
-        # raises AttributeError. getattr(..., True) falls back to the same
-        # default that parse_args() would have given it via add_argument.
         if getattr(cfg, 'use_multi_gpu', True) and self.num_gpus > 1:
             print(f"\n📦 Wrapping model for {self.num_gpus}-GPU training via DataParallel")
             self.model = nn.DataParallel(self.model)
@@ -388,17 +468,17 @@ class Trainer:
         self.matcher    = WindowMatcher(
             pos_iou_thresh=cfg.pos_iou_thresh,
             neg_iou_thresh=cfg.neg_iou_thresh,
-            n_neg_ratio=cfg.n_neg_ratio,
         )
+        self.concat = ConcatenateAlgorithm(merge_gap_thresh=cfg.merge_gap_thresh)
 
-        self.criterion = MTHARSLoss(
-            n_classes=self.n_classes,
-            alpha=cfg.alpha,
+        # CHANGED: SegmentationLoss instead of MTHARSLoss — no `alpha`,
+        # adds `gamma`/`pos_weight` for the new objectness term.
+        self.criterion = SegmentationLoss(
             beta=cfg.beta,
-            n_neg_ratio=cfg.n_neg_ratio,
+            gamma=cfg.gamma,
+            pos_weight=cfg.pos_weight,
         )
 
-        # Optimization Core Selection
         if cfg.optimizer.lower() == 'adamw':
             self.optimizer = optim.AdamW(
                 self.model.parameters(),
@@ -412,7 +492,6 @@ class Trainer:
                 weight_decay=cfg.weight_decay,
             )
 
-        # Dual-Stage Chained Warmup Scheduler Realization
         base_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=max(1, cfg.epochs - cfg.warmup_epochs), eta_min=1e-6
         )
@@ -429,14 +508,13 @@ class Trainer:
             self.scheduler = base_scheduler
 
         self.scaler = GradScaler() if (self.device.type == 'cuda' and cfg.amp) else None
-        self.best_f1   = 0.0
+        self.best_iou = 0.0
 
     def run(self) -> float:
         cfg = self.cfg
         print(f'\nInitialization Verification. Outputs Routing to: {self.exp_dir}\n')
-        
-        # Telemetry storage for visualization engine
-        history = {"train_loss": [], "val_f1": [], "conf_loss": [], "loc_loss": []}
+
+        history = {"train_loss": [], "loc_loss": [], "obj_loss": [], "val_iou": []}
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
@@ -450,84 +528,79 @@ class Trainer:
             )
             eval_stats = evaluate(
                 self.model, self.test_dl,
-                self.device, self.n_classes,
+                self.device, self.concat,
             )
             self.scheduler.step()
 
-            # Live Telemetry Pushes to TensorBoard Logging Streams
             current_lr = self.optimizer.param_groups[0]['lr']
             self.writer.add_scalar('Engine/Learning_Rate', current_lr, epoch)
             self.writer.add_scalar('Losses/Total_Loss', train_stats["total_loss"], epoch)
-            self.writer.add_scalar('Losses/Confidence_Component', train_stats["conf_loss"], epoch)
             self.writer.add_scalar('Losses/Localization_Component', train_stats["loc_loss"], epoch)
-            self.writer.add_scalar('Evaluation/Accuracy', eval_stats["accuracy"], epoch)
-            self.writer.add_scalar('Evaluation/Macro_F1', eval_stats["f1"], epoch)
+            self.writer.add_scalar('Losses/Objectness_Component', train_stats["obj_loss"], epoch)
+            self.writer.add_scalar('Evaluation/Foreground_IoU', eval_stats["foreground_iou"], epoch)
 
-            # Record internal history profiles
             history["train_loss"].append(train_stats["total_loss"])
-            history["conf_loss"].append(train_stats["conf_loss"])
             history["loc_loss"].append(train_stats["loc_loss"])
-            history["val_f1"].append(eval_stats["f1"])
+            history["obj_loss"].append(train_stats["obj_loss"])
+            history["val_iou"].append(eval_stats["foreground_iou"])
 
             elapsed = time.time() - t0
             print(
                 f'Epoch {epoch:03d}/{cfg.epochs} '
                 f'| loss {train_stats["total_loss"]:.4f} '
-                f'(conf {train_stats["conf_loss"]:.4f} '
-                f'loc {train_stats["loc_loss"]:.4f}) '
-                f'| acc {eval_stats["accuracy"]:.4f} '
-                f'| F1 {eval_stats["f1"]:.4f} '
+                f'(loc {train_stats["loc_loss"]:.4f} '
+                f'obj {train_stats["obj_loss"]:.4f}) '
+                f'| fg-IoU {eval_stats["foreground_iou"]:.4f} '
                 f'| {elapsed:.1f}s'
             )
 
-            if eval_stats['f1'] > self.best_f1:
-                self.best_f1 = eval_stats['f1']
+            if eval_stats['foreground_iou'] > self.best_iou:
+                self.best_iou = eval_stats['foreground_iou']
                 ckpt = self.exp_dir / 'best_model.pt'
-                
-                # Save model correctly for both single and multi-GPU
+
                 model_state = self.model.module.state_dict() if isinstance(self.model, nn.DataParallel) else self.model.state_dict()
-                
+
                 torch.save({
                     'epoch':     epoch,
                     'state_dict': model_state,
-                    'f1':        self.best_f1,
+                    'foreground_iou': self.best_iou,
                     'cfg':        vars(cfg),
                 }, ckpt)
-                print(f'  ✓ New best F1 {self.best_f1:.4f} saved → {ckpt}')
+                print(f'  ✓ New best fg-IoU {self.best_iou:.4f} saved → {ckpt}')
 
         self.writer.close()
         self.generate_report_image(history)
-        return self.best_f1
+        return self.best_iou
 
     def generate_report_image(self, history: Dict[str, List[float]]):
         """
-        Deliverable 3: Compiles structural training performance metadata into a PNG graphic.
+        Compiles training performance metadata into a PNG graphic.
+        CHANGED: loss-decomposition chart plots loc/obj instead of
+        conf/loc; the metric panel plots foreground IoU instead of F1.
         """
         epochs_range = range(1, len(history["train_loss"]) + 1)
-        
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
-        # Chart 1: Multi-Task Sub-loss Decomposition Curves
         ax1.plot(epochs_range, history["train_loss"], color='black', linewidth=2, label='Total Loss')
-        ax1.plot(epochs_range, history["conf_loss"], color='crimson', linestyle=':', label='Conf Loss (α)')
         ax1.plot(epochs_range, history["loc_loss"], color='darkorange', linestyle='--', label='Loc Loss (β)')
+        ax1.plot(epochs_range, history["obj_loss"], color='teal', linestyle=':', label='Objectness Loss (γ)')
         ax1.set_xlabel('Training Epochs')
         ax1.set_ylabel('Loss Magnitudes')
-        ax1.set_title('Multi-Task Objective Component Decomposition')
+        ax1.set_title('Segmentation-Only Objective Component Decomposition')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
 
-        # Chart 2: Target Performance Metric Progression
         ax3 = ax2.twinx()
         p1 = ax2.plot(epochs_range, history["train_loss"], color='tab:red', alpha=0.7, label='Train Loss')
-        p2 = ax3.plot(epochs_range, history["val_f1"], color='tab:blue', linewidth=2, label='Validation F1')
-        
+        p2 = ax3.plot(epochs_range, history["val_iou"], color='tab:blue', linewidth=2, label='Foreground IoU')
+
         ax2.set_xlabel('Training Epochs')
         ax2.set_ylabel('Loss', color='tab:red')
-        ax3.set_ylabel('Macro F1 Score', color='tab:blue')
+        ax3.set_ylabel('Foreground IoU', color='tab:blue')
         ax2.tick_params(axis='y', labelcolor='tab:red')
         ax3.tick_params(axis='y', labelcolor='tab:blue')
-        
+
         plots = p1 + p2
         labels = [l.get_label() for l in plots]
         ax2.legend(plots, labels, loc='center right')
@@ -535,9 +608,9 @@ class Trainer:
         ax2.grid(True, alpha=0.3)
 
         gpu_info = f"GPU Mode ({self.num_gpus} GPUs)" if self.num_gpus > 0 else "CPU Mode"
-        plt.suptitle(f"Execution Analysis Matrix\nDataset: {self.cfg.dataset} | Optimizer: {self.cfg.optimizer} | {gpu_info}", fontsize=12, fontweight='bold')
+        plt.suptitle(f"Execution Analysis Matrix (Segmentation-Only)\nDataset: {self.cfg.dataset} | Optimizer: {self.cfg.optimizer} | {gpu_info}", fontsize=12, fontweight='bold')
         fig.tight_layout()
-        
+
         report_path = self.exp_dir / 'evaluation_report.png'
         plt.savefig(report_path, dpi=150)
         plt.close()
@@ -545,31 +618,33 @@ class Trainer:
 
 
 # ---------------------------------------------------------------------------
-# Ablation Study Runner  (Section IV-F)
+# Ablation Study Runner
 # ---------------------------------------------------------------------------
 
 def run_ablation_study(base_cfg: argparse.Namespace) -> None:
     """
-    Systematically sweep α/β weights and scale s values
-    as in Tables VII and VIII of the paper.
+    CHANGED: the original α/β sweep (Table VII) doesn't apply — α/L_conf
+    no longer exists. Replaced with a β/γ sweep (localization weight vs.
+    objectness weight) plus the original scale sweep (Table VIII), which
+    still matters for boundary regression quality.
     """
     print('\n' + '='*60)
-    print('ABLATION: α / β weight combinations (Table VII)')
+    print('ABLATION: β / γ weight combinations (segmentation-only analogue of Table VII)')
     print('='*60)
 
     weight_combos = [
-        (1, 1), (1, 2), (1, 3), (2, 1), (2, 3)
+        (1, 1), (1, 2), (2, 1), (3, 1)
     ]
-    for alpha, beta in weight_combos:
+    for beta, gamma in weight_combos:
         cfg = argparse.Namespace(**vars(base_cfg))
-        cfg.alpha  = float(alpha)
         cfg.beta   = float(beta)
+        cfg.gamma  = float(gamma)
         cfg.scales = [2.0, 3.0]
-        cfg.epochs = min(cfg.epochs, 30)   # quick ablation
-        print(f'\nα={alpha}, β={beta}')
+        cfg.epochs = min(cfg.epochs, 30)
+        print(f'\nβ={beta}, γ={gamma}')
         t = Trainer(cfg)
-        f1 = t.run()
-        print(f'  → F1 = {f1:.4f}')
+        iou = t.run()
+        print(f'  → fg-IoU = {iou:.4f}')
 
     print('\n' + '='*60)
     print('ABLATION: scale s combinations (Table VIII)')
@@ -583,14 +658,14 @@ def run_ablation_study(base_cfg: argparse.Namespace) -> None:
     ]
     for scales in scale_combos:
         cfg = argparse.Namespace(**vars(base_cfg))
-        cfg.alpha  = 1.0
         cfg.beta   = 1.0
+        cfg.gamma  = 1.0
         cfg.scales = scales
         cfg.epochs = min(cfg.epochs, 30)
         print(f'\ns = {scales}')
         t = Trainer(cfg)
-        f1 = t.run()
-        print(f'  → F1 = {f1:.4f}')
+        iou = t.run()
+        print(f'  → fg-IoU = {iou:.4f}')
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +673,7 @@ def run_ablation_study(base_cfg: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description='Train MTHARS')
+    p = argparse.ArgumentParser(description='Train MTHARS (segmentation-only)')
 
     # Data
     p.add_argument('--dataset',   type=str, default='UCI',
@@ -612,14 +687,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument('--feat_dim', type=int,   default=256)
     p.add_argument('--scales',   type=float, nargs='+', default=[2.0, 3.0])
 
-    # Loss (ablation)
-    p.add_argument('--alpha',   type=float, default=1.0)
-    p.add_argument('--beta',    type=float, default=1.0)
-    p.add_argument('--n_neg_ratio', type=int, default=3)
+    # Loss
+    # CHANGED: --alpha removed (no classification term). --gamma and
+    # --pos_weight added for the new objectness term.
+    p.add_argument('--beta',       type=float, default=1.0)
+    p.add_argument('--gamma',      type=float, default=1.0)
+    p.add_argument('--pos_weight', type=float, default=3.0,
+                   help='BCEWithLogitsLoss pos_weight for the objectness head')
 
-    # IOU thresholds
+    # IOU thresholds (window↔instance assignment)
     p.add_argument('--pos_iou_thresh', type=float, default=0.5)
     p.add_argument('--neg_iou_thresh', type=float, default=0.3)
+
+    # NEW: ConcatenateAlgorithm gap threshold (replaces the "class changed"
+    # stopping condition, which no longer applies with a single class)
+    p.add_argument('--merge_gap_thresh', type=int, default=5,
+                   help='Max sample gap between detections before closing a segment')
 
     # Training
     p.add_argument('--epochs',       type=int,   default=100)
@@ -629,7 +712,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument('--amp',          action='store_true', default=True, help='Enable automatic mixed precision')
     p.add_argument('--seed',         type=int,   default=42)
 
-    # Added Experimental Tuning Architecture Hooks
     p.add_argument('--optimizer', type=str, default='AdamW', choices=['Adam', 'AdamW'],
                    help='Target optimization engine implementation type')
     p.add_argument('--max_norm', type=float, default=1.0,
@@ -637,15 +719,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument('--warmup_epochs', type=int, default=5,
                    help='Linear training update introduction phase epoch duration')
 
-    # ── GPU OPTIMIZATION PARAMETERS ────────────────────────────────────────
     p.add_argument('--num_workers', type=int, default=4,
                    help='Number of workers for parallel data loading (optimal for Kaggle GPUs)')
     p.add_argument('--use_multi_gpu', action='store_true', default=True,
                    help='Enable multi-GPU training via DataParallel if available')
 
-    # Ablation
     p.add_argument('--ablation', action='store_true',
-                   help='Run full ablation study (Sec IV-F)')
+                   help='Run β/γ + scale ablation study (segmentation-only)')
 
     return p.parse_args(argv)
 
