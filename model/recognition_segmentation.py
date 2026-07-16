@@ -1,453 +1,312 @@
 """
-model/recognition_segmentation.py
-===================================
-Section III-C & III-D: Recognition and Segmentation Module + NMS.
+model/multiscale_windows.py  (SEGMENTATION-ONLY VARIANT)
+===========================================================
+Section III-B of the paper: Multiscale Window Generation and Matching.
 
-Components
-----------
-1. NonMaximumSuppression
-   – filters overlapping predicted windows (Section III-B, NMS sub-section).
+CHANGED vs. the multi-task version
+-----------------------------------
+Implements §4.B ("Segmentation-only conversion") step 2 from the
+coupling-map analysis:
 
-2. RecognitionSegmentationNet
-   – dual-branch Conv1D head that predicts:
-       • class probabilities for each window    (k+1 values per window)
-       • boundary offsets for each window       (2 values per window: f_x, f_l)
+  - `WindowMatcher.match()` no longer returns a per-class `matched_labels`
+    tensor at all. With no `cls_branch` (deleted in `model/segmentation.py`),
+    there's nothing that predicts a class, so there's no per-class target
+    to build. As the analysis doc puts it: "you still need pos_mask for
+    offset supervision, but the label tensor itself becomes trivial" — in
+    fact it's not just trivial, it's *redundant* with `pos_mask` itself
+    (foreground = `pos_mask`, background = `~pos_mask`), so it is dropped
+    from the return signature entirely rather than kept as a
+    always-equal-to-pos_mask.long() dead value.
+  - Return signature changes from
+        (matched_labels, matched_offsets, pos_mask)
+    to
+        (matched_offsets, pos_mask)
+    `pos_mask` doubles as the binary foreground/background target for the
+    new objectness head (see `model/segmentation.py`).
 
-3. MTHARS
-   – full multi-task network:
-       backbone (SKNet1D) → Windows Generate → RecognitionSegmentationNet
-   – returns class logits + offsets during training
-   – returns decoded activity segments during inference
-
-4. ConcatenateAlgorithm
-   – Algorithm 1 from the paper: merges adjacent windows of the same
-     class into contiguous activity segments.
+Kept unchanged
+---------------
+  - `offset_encode` / `offset_decode` (Equations 1-4) — segmentation-only
+    still regresses boundaries, so these are still needed, unlike in the
+    recognition-only variant.
+  - `WindowGenerator`, `iou_1d`, `iou_matrix` — unchanged.
+  - `WindowMatcher.hard_negative_mining` — DELETED. Per the analysis doc's
+    §4.B step 1, hard-negative mining existed only to feed the per-class
+    `ClassificationLoss`, which no longer exists. The new binary objectness
+    loss (see `training/losses.py`) handles foreground/background
+    imbalance via `pos_weight` in `BCEWithLogitsLoss` instead of explicit
+    negative mining.
 """
 
 from __future__ import annotations
 
-from typing import List, Tuple, Dict, Optional
+import math
+from typing import List, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from backbone.sknet import SKNet1D
-from model.multiscale_windows import (
-    WindowGenerator, offset_decode, iou_1d
-)
 
 
 # ---------------------------------------------------------------------------
-# Non-Maximum Suppression  (Section III-B)
+# 1-D Interval IOU
 # ---------------------------------------------------------------------------
 
-class NonMaximumSuppression:
+def iou_1d(windows: torch.Tensor,
+           gt_box: torch.Tensor) -> torch.Tensor:
     """
-    Remove highly overlapping windows, retaining the highest-confidence one.
-
-    Algorithm (from the paper):
-        1. Sort windows by their maximum class probability c (descending).
-        2. Select the top window W_1 as a base; discard windows whose
-           IOU with W_1 exceeds `iou_thresh`.
-        3. Repeat with the next surviving window until the list is empty.
+    Compute IOU between a set of windows and a single ground-truth box.
 
     Args:
-        iou_thresh    : IOU above which a window is suppressed (default 0.5).
-        score_thresh  : discard windows whose max-class-prob < score_thresh.
-        max_detections: hard cap on the number of kept windows.
-    """
-
-    def __init__(self,
-                 iou_thresh:    float = 0.50,
-                 score_thresh:  float = 0.01,
-                 max_detections: int  = 200):
-        self.iou_thresh     = iou_thresh
-        self.score_thresh   = score_thresh
-        self.max_detections = max_detections
-
-    def __call__(self,
-                 windows:     torch.Tensor,
-                 class_probs: torch.Tensor
-                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            windows     : (na, 2)    decoded windows [center, length]
-            class_probs : (na, K+1) softmax probabilities (col 0 = background)
-
-        Returns:
-            kept_windows : (M, 2)   retained windows
-            kept_scores  : (M,)     max class probability
-            kept_classes : (M,)     predicted class index (0 = background)
-        """
-        # Max prob and predicted class (ignoring background col 0)
-        fg_probs, fg_classes = class_probs[:, 1:].max(dim=1)
-        fg_classes = fg_classes + 1      # shift back to 1-indexed
-
-        # Filter by score threshold
-        keep = fg_probs >= self.score_thresh
-        windows     = windows[keep]
-        fg_probs    = fg_probs[keep]
-        fg_classes  = fg_classes[keep]
-
-        if windows.shape[0] == 0:
-            return windows, fg_probs, fg_classes
-
-        # Sort descending by probability
-        order = fg_probs.argsort(descending=True)
-        windows    = windows[order]
-        fg_probs   = fg_probs[order]
-        fg_classes = fg_classes[order]
-
-        kept_idx = []
-        # FIX: previously `torch.zeros(len(windows), dtype=torch.bool)` and the
-        # `torch.tensor(kept_idx, dtype=torch.long)` below both defaulted to
-        # CPU. When `windows` (and therefore `class_probs`) live on a CUDA
-        # device — which they will the moment predict() is called on a GPU
-        # model — indexing/assigning across these mismatched devices raises a
-        # RuntimeError. Allocate both on windows.device instead.
-        suppressed = torch.zeros(len(windows), dtype=torch.bool, device=windows.device)
-
-        for i in range(len(windows)):
-            if suppressed[i]:
-                continue
-            kept_idx.append(i)
-            if len(kept_idx) >= self.max_detections:
-                break
-
-            # Suppress windows with high IOU with the current base
-            iou = iou_1d(windows[i+1:], windows[i])
-            suppress_mask = iou > self.iou_thresh
-            suppressed[i+1:][suppress_mask] = True
-
-        kept_idx = torch.tensor(kept_idx, dtype=torch.long, device=windows.device)
-        return windows[kept_idx], fg_probs[kept_idx], fg_classes[kept_idx]
-
-
-# ---------------------------------------------------------------------------
-# Recognition and Segmentation Module  (Section III-D)
-# ---------------------------------------------------------------------------
-
-class RecognitionSegmentationNet(nn.Module):
-    """
-    Dual-branch Conv1D head operating on the backbone feature sequence.
-
-    Input  : (B, feat_dim, n_feat)  – backbone feature sequence
-    Output :
-        class_logits : (B, n_feat * n_windows_per_unit, K+1)
-        offsets      : (B, n_feat * n_windows_per_unit, 2)
-
-    where  n_windows_per_unit = n_scales × 2  (two lengths per scale).
-
-    Design note (Section III-D):
-        We use Conv1D rather than FC layers to keep the number of
-        parameters manageable and to preserve the correspondence between
-        spatial positions in the feature map and window centers.
-    """
-
-    def __init__(self,
-                 feat_dim:            int,
-                 n_classes:           int,
-                 n_windows_per_unit:  int):
-        """
-        Args:
-            feat_dim           : channels in the backbone output.
-            n_classes          : number of activity classes K
-                                 (output has K+1 channels, col-0 = background).
-            n_windows_per_unit : number of anchor windows per feature unit
-                                 = len(scales) × 2.
-        """
-        super().__init__()
-        self.n_classes          = n_classes
-        self.n_windows_per_unit = n_windows_per_unit
-
-        # Shared feature refinement
-        self.shared = nn.Sequential(
-            nn.Conv1d(feat_dim, feat_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(feat_dim),
-            nn.ReLU(inplace=False),
-        )
-
-        # Class prediction branch: outputs  n_windows_per_unit × (K+1)  per position
-        self.cls_branch = nn.Conv1d(
-            feat_dim,
-            n_windows_per_unit * (n_classes + 1),
-            kernel_size=3, padding=1
-        )
-
-        # Offset prediction branch: outputs  n_windows_per_unit × 2  per position
-        self.off_branch = nn.Conv1d(
-            feat_dim,
-            n_windows_per_unit * 2,
-            kernel_size=3, padding=1
-        )
-
-    def forward(self, feat_seq: torch.Tensor
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            feat_seq : (B, feat_dim, n_feat)
-
-        Returns:
-            class_logits : (B, n_feat * n_wpu, K+1)
-            offsets      : (B, n_feat * n_wpu, 2)
-        """
-        B = feat_seq.shape[0]
-        x = self.shared(feat_seq)              # (B, feat_dim, n_feat)
-
-        # Class branch
-        cls = self.cls_branch(x)               # (B, n_wpu*(K+1), n_feat)
-        cls = cls.permute(0, 2, 1)             # (B, n_feat, n_wpu*(K+1))
-        cls = cls.contiguous().view(
-            B, -1, self.n_classes + 1          # (B, n_feat*n_wpu, K+1)
-        )
-
-        # Offset branch
-        off = self.off_branch(x)               # (B, n_wpu*2, n_feat)
-        off = off.permute(0, 2, 1)             # (B, n_feat, n_wpu*2)
-        off = off.contiguous().view(B, -1, 2)  # (B, n_feat*n_wpu, 2)
-
-        return cls, off
-
-
-# ---------------------------------------------------------------------------
-# Full MTHARS Network
-# ---------------------------------------------------------------------------
-
-class MTHARS(nn.Module):
-    """
-    Multi-Task Human Activity Recognition and Segmentation network.
-
-    Architecture (Fig. 3 of the paper):
-        Input → SKNet1D backbone → Windows Generate →
-        RecognitionSegmentationNet → {class_logits, offsets}
-
-    During *training* call forward() which returns logits and offsets.
-    During *inference* call predict() which applies NMS and the
-    concatenation algorithm to return activity segments.
-
-    Args:
-        in_channels   : number of sensor input channels (C).
-        n_classes     : number of activity classes K.
-        scales        : list of scale values for window generation.
-        feat_dim      : backbone output channel width.
-        data_len      : raw activity stream length fed to the network
-                        per forward pass (must be fixed, e.g. 300).
-        nms_iou_thresh: IOU threshold for NMS.
-        nms_score_thr : minimum class score threshold for NMS.
-    """
-
-    def __init__(self,
-                 in_channels:    int,
-                 n_classes:      int,
-                 scales:         List[float] = None,
-                 feat_dim:       int = 256,
-                 data_len:       int = 300,
-                 nms_iou_thresh: float = 0.5,
-                 nms_score_thr:  float = 0.01):
-        super().__init__()
-
-        if scales is None:
-            scales = [2.0, 3.0]          # paper's best setting (Table VIII)
-
-        self.scales   = scales
-        self.data_len = data_len
-
-        # ---- Backbone ----
-        self.backbone = SKNet1D(in_channels=in_channels, feat_dim=feat_dim)
-
-        # Infer feat_len by a dummy forward pass
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, data_len)
-            feat_len = self.backbone(dummy).shape[-1]
-
-        self.feat_len = feat_len
-
-        # ---- Window Generator (static, not learned) ----
-        self.window_gen = WindowGenerator(
-            scales=scales, feat_len=feat_len, data_len=data_len
-        )
-        n_wpu = len(scales) * 2         # windows per feature unit
-
-        # ---- Recognition & Segmentation Head ----
-        self.head = RecognitionSegmentationNet(
-            feat_dim=feat_dim,
-            n_classes=n_classes,
-            n_windows_per_unit=n_wpu,
-        )
-
-        # ---- NMS for inference ----
-        self.nms = NonMaximumSuppression(
-            iou_thresh=nms_iou_thresh,
-            score_thresh=nms_score_thr,
-        )
-
-    # ------------------------------------------------------------------
-    # Training forward pass
-    # ------------------------------------------------------------------
-
-    def forward(self, x: torch.Tensor
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x : (B, C, T)  sensor window (T must equal self.data_len)
-
-        Returns:
-            class_logits : (B, na, K+1)
-            offsets      : (B, na, 2)
-        """
-        feat = self.backbone(x)                 # (B, feat_dim, n_feat)
-        cls_logits, offsets = self.head(feat)   # (B, na, K+1), (B, na, 2)
-        return cls_logits, offsets
-
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def predict(self, x: torch.Tensor
-                ) -> List[List[Dict]]:
-        """
-        Full inference pipeline: forward → decode → NMS.
-
-        Args:
-            x : (B, C, T) sensor input
-
-        Returns:
-            batch_results : list of B lists, each containing dicts:
-                {'center': float, 'length': float,
-                 'start': int,   'end': int,
-                 'class': int,   'score': float}
-        """
-        self.eval()
-        cls_logits, raw_offsets = self.forward(x)  # (B, na, K+1), (B, na, 2)
-        class_probs = F.softmax(cls_logits, dim=-1) # (B, na, K+1)
-
-        anchors = self.window_gen.windows.to(x.device)  # (na, 2)
-        batch_results = []
-
-        for b in range(x.shape[0]):
-            probs   = class_probs[b]                     # (na, K+1)
-            offsets = raw_offsets[b]                     # (na, 2)
-
-            # Decode predicted boxes
-            pred_boxes = offset_decode(anchors, offsets)  # (na, 2)
-
-            # NMS
-            kept_windows, kept_scores, kept_classes = self.nms(
-                pred_boxes, probs
-            )
-
-            results = []
-            for i in range(len(kept_windows)):
-                cx  = kept_windows[i, 0].item()
-                ln  = kept_windows[i, 1].item()
-                st  = max(0,   int(cx - ln / 2))
-                en  = min(self.data_len - 1, int(cx + ln / 2))
-                results.append({
-                    'center': cx,
-                    'length': ln,
-                    'start':  st,
-                    'end':    en,
-                    'class':  kept_classes[i].item(),
-                    'score':  kept_scores[i].item(),
-                })
-            batch_results.append(results)
-
-        return batch_results
-
-
-# ---------------------------------------------------------------------------
-# Concatenation Algorithm  (Algorithm 1 in the paper)
-# ---------------------------------------------------------------------------
-
-class ConcatenateAlgorithm:
-    """
-    Merge adjacent predicted windows of the same activity class into
-    contiguous activity segments.
-
-    This implements Algorithm 1 exactly:
-        - Sort predictions by start position.
-        - Walk through sequentially; whenever the class changes, close
-          the current segment and open a new one.
-
-    Args:
-        segments_per_batch : list of per-sample segment lists produced by
-                             MTHARS.predict().
+        windows : (N, 2)  – each row [center_x, length] in absolute coords
+        gt_box  : (2,)    – [center_x, length] of the truth boundary
 
     Returns:
-        merged : list (per sample) of merged segments
-                 {'start': int, 'end': int, 'label': int, 'score': float}
+        iou : (N,) float tensor in [0, 1]
     """
+    w_start = windows[:, 0] - windows[:, 1] / 2
+    w_end   = windows[:, 0] + windows[:, 1] / 2
 
-    @staticmethod
-    def merge(segments: List[Dict]) -> List[Dict]:
-        """Merge a single sample's segment list."""
-        if not segments:
-            return []
+    g_start = gt_box[0] - gt_box[1] / 2
+    g_end   = gt_box[0] + gt_box[1] / 2
 
-        # Sort by start position
-        segs = sorted(segments, key=lambda s: s['start'])
+    inter_start = torch.max(w_start, g_start)
+    inter_end   = torch.min(w_end,   g_end)
+    inter       = (inter_end - inter_start).clamp(min=0)
 
-        merged = []
-        cur_class = segs[0]['class']
-        cur_start = segs[0]['start']
-        cur_end   = segs[0]['end']
-        cur_score = segs[0]['score']
+    union = windows[:, 1] + gt_box[1] - inter
+    return inter / union.clamp(min=1e-6)
 
-        for seg in segs[1:]:
-            if seg['class'] == cur_class:
-                # Extend current segment
-                cur_end   = max(cur_end, seg['end'])
-                cur_score = max(cur_score, seg['score'])
-            else:
-                merged.append({'start': cur_start,
-                               'end':   cur_end,
-                               'label': cur_class,
-                               'score': cur_score})
-                cur_class = seg['class']
-                cur_start = seg['start']
-                cur_end   = seg['end']
-                cur_score = seg['score']
 
-        merged.append({'start': cur_start,
-                       'end':   cur_end,
-                       'label': cur_class,
-                       'score': cur_score})
-        return merged
+def iou_matrix(windows: torch.Tensor,
+               gt_boxes: torch.Tensor) -> torch.Tensor:
+    """
+    Compute full IOU matrix between all windows and all GT boxes.
 
-    def __call__(self,
-                 batch_segs: List[List[Dict]]
-                 ) -> List[List[Dict]]:
-        return [self.merge(s) for s in batch_segs]
+    Args:
+        windows  : (na, 2)  windows in (center, length) form
+        gt_boxes : (nb, 2)  GT boxes in (center, length) form
+
+    Returns:
+        M : (na, nb) IOU matrix
+    """
+    na = windows.shape[0]
+    nb = gt_boxes.shape[0]
+    M = torch.zeros(na, nb, device=windows.device, dtype=windows.dtype)
+    for j in range(nb):
+        M[:, j] = iou_1d(windows, gt_boxes[j])
+    return M
 
 
 # ---------------------------------------------------------------------------
-# Sanity check
+# Offset encoding / decoding  (Equations 1-4) — UNCHANGED, still needed
+# ---------------------------------------------------------------------------
+
+def offset_encode(windows: torch.Tensor,
+                  gt_boxes: torch.Tensor) -> torch.Tensor:
+    """
+    Encode ground-truth boxes relative to matched windows.
+
+    Implements Equations (1) and (2):
+        f_x = (t_x - w_x) / w_l
+        f_l = log(t_l / w_l)
+    """
+    f_x = (gt_boxes[:, 0] - windows[:, 0]) / windows[:, 1].clamp(min=1e-6)
+    f_l = torch.log(gt_boxes[:, 1] / windows[:, 1].clamp(min=1e-6))
+    return torch.stack([f_x, f_l], dim=1)
+
+
+def offset_decode(windows: torch.Tensor,
+                  offsets: torch.Tensor) -> torch.Tensor:
+    """
+    Decode predicted offsets back to absolute boundaries.
+
+    Implements Equations (3) and (4):
+        t̂_x = f_x * w_l + w_x
+        t̂_l = w_l * exp(f_l)
+    """
+    pred_x = offsets[:, 0] * windows[:, 1] + windows[:, 0]
+    pred_l = windows[:, 1] * torch.exp(offsets[:, 1])
+    return torch.stack([pred_x, pred_l], dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Window Generator  (unchanged from multi-task version)
+# ---------------------------------------------------------------------------
+
+class WindowGenerator:
+    """
+    Generate multiscale anchor windows for a 1-D feature sequence.
+
+    Args:
+        scales     : list of scale values s ∈ (0, 1]
+        feat_len   : length of the backbone feature sequence (n_feat)
+        data_len   : length of the original raw activity stream (n)
+    """
+
+    def __init__(self, scales: List[float],
+                 feat_len: int,
+                 data_len: int):
+        self.scales   = scales
+        self.feat_len = feat_len
+        self.data_len = data_len
+        self.windows  = self._generate()
+
+    def _generate(self) -> torch.Tensor:
+        ratio = self.data_len / self.feat_len
+
+        window_list = []
+        for x in range(self.feat_len):
+            center_data = (x + 0.5) * ratio
+
+            for s in self.scales:
+                sqrts = math.sqrt(s)
+                for length_data in [self.feat_len * sqrts * ratio,
+                                    self.feat_len / sqrts * ratio]:
+                    window_list.append([center_data, length_data])
+
+        return torch.tensor(window_list, dtype=torch.float32)
+
+    @property
+    def num_windows(self) -> int:
+        return self.windows.shape[0]
+
+    def to_start_end(self) -> torch.Tensor:
+        centers = self.windows[:, 0]
+        lengths = self.windows[:, 1]
+        starts  = (centers - lengths / 2).clamp(min=0)
+        ends    = (centers + lengths / 2).clamp(max=self.data_len - 1)
+        return torch.stack([starts, ends], dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Window Matcher  (SEGMENTATION-ONLY: labels collapsed away, offsets kept)
+# ---------------------------------------------------------------------------
+
+class WindowMatcher:
+    """
+    Match generated windows to ground-truth activity bounding boxes.
+
+    Step 1: Find the best window for every GT box (highest IOU).
+    Step 2: For remaining unmatched windows, assign the GT box with the
+            highest IOU if that IOU exceeds `pos_iou_thresh`.
+    Step 3: Windows with IOU < neg_iou_thresh for ALL GT boxes become
+            background.
+
+    Args:
+        pos_iou_thresh : minimum IOU to label a window as positive
+        neg_iou_thresh : maximum IOU for a window to be labelled background
+                        (kept for interface parity / future re-use, though
+                        segmentation-only doesn't do explicit "ignore"
+                        handling any differently than recognition-only did)
+    """
+
+    def __init__(self,
+                 pos_iou_thresh: float = 0.5,
+                 neg_iou_thresh: float = 0.3):
+        self.pos_iou_thresh = pos_iou_thresh
+        self.neg_iou_thresh = neg_iou_thresh
+
+    def match(self,
+              windows:  torch.Tensor,
+              gt_boxes: torch.Tensor
+              ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            windows   : (na, 2)  anchor windows [center, length]
+            gt_boxes  : (nb, 2)  GT bounding boxes [center, length]
+                       (no gt_labels arg anymore — there is no class to
+                        assign, only a foreground/background + boundary)
+
+        Returns:
+            matched_offsets : (na, 2)  encoded offsets (valid for positives)
+            pos_mask        : (na,)    bool mask of positive (foreground)
+                              windows — doubles as the objectness target
+        """
+        na = windows.shape[0]
+        nb = gt_boxes.shape[0]
+        device = windows.device
+
+        matched_offsets = torch.zeros(na, 2, dtype=torch.float32, device=device)
+        assigned_gt     = torch.full((na,), -1, dtype=torch.long, device=device)
+
+        if nb == 0:
+            return matched_offsets, torch.zeros(na, dtype=torch.bool, device=device)
+
+        M = iou_matrix(windows, gt_boxes)
+        M_work = M.clone()
+
+        # ---- Step 1: guarantee every GT box gets its best window ----
+        for _ in range(nb):
+            best = M_work.max()
+            if best.item() == 0:
+                break
+            flat_idx = M_work.argmax()
+            i = flat_idx // nb
+            j = flat_idx %  nb
+            assigned_gt[i] = j
+            M_work[i, :] = -1
+            M_work[:, j] = -1
+
+        # ---- Step 2: match remaining windows by threshold (vectorized) ----
+        unassigned = assigned_gt < 0
+        best_iou, best_j = M.max(dim=1)
+
+        take_pos = unassigned & (best_iou >= self.pos_iou_thresh)
+        take_ignore = (unassigned
+                       & (best_iou >= self.neg_iou_thresh)
+                       & (best_iou < self.pos_iou_thresh))
+
+        assigned_gt = torch.where(take_pos, best_j, assigned_gt)
+        assigned_gt = torch.where(
+            take_ignore, torch.full_like(assigned_gt, -2), assigned_gt
+        )
+
+        # ---- Step 3: encode offsets only — no label tensor at all ----
+        pos_mask = assigned_gt >= 0
+        pos_idx  = pos_mask.nonzero(as_tuple=True)[0]
+        j_idx    = assigned_gt[pos_idx]
+        matched_offsets[pos_idx] = offset_encode(windows[pos_idx], gt_boxes[j_idx])
+
+        return matched_offsets, pos_mask
+
+    # NOTE: hard_negative_mining intentionally DELETED here. It only ever
+    # fed the per-class ClassificationLoss, which no longer exists in the
+    # segmentation-only variant. Foreground/background imbalance is now
+    # handled via `pos_weight` in the new binary ObjectnessLoss (see
+    # training/losses.py) instead of explicit top-k negative selection.
+
+
+# ---------------------------------------------------------------------------
+# Quick functional test
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    B, C, T = 2, 9, 300
-    K = 6
+    feat_len = 8
+    data_len = 64
+    scales   = [0.5, 1.0]
 
-    model = MTHARS(in_channels=C, n_classes=K,
-                   scales=[2.0, 3.0], feat_dim=128, data_len=T)
+    gen = WindowGenerator(scales=scales, feat_len=feat_len, data_len=data_len)
+    print(f'Generated {gen.num_windows} windows for feat_len={feat_len}, '
+          f'data_len={data_len}, scales={scales}')
 
-    print(f'Backbone feat_len : {model.feat_len}')
-    print(f'Total anchors     : {model.window_gen.num_windows}')
+    gt_boxes = torch.tensor([[15.0, 20.0],
+                              [45.0, 10.0]])
 
-    x = torch.randn(B, C, T)
+    matcher = WindowMatcher(pos_iou_thresh=0.4)
+    off, pos = matcher.match(gen.windows, gt_boxes)
 
-    # Training mode
-    model.train()
-    cls_out, off_out = model(x)
-    print(f'[Train] cls_logits : {tuple(cls_out.shape)}')   # (B, na, K+1)
-    print(f'[Train] offsets    : {tuple(off_out.shape)}')   # (B, na, 2)
+    print(f'Positive (foreground) windows: {pos.sum().item()}')
+    print(f'Background windows           : {(~pos).sum().item()}')
 
-    # Inference mode
-    results = model.predict(x)
-    concat  = ConcatenateAlgorithm()(results)
-    for b, segs in enumerate(concat):
-        print(f'[Infer] Sample {b}: {len(segs)} activity segment(s)')
-        for s in segs[:3]:
-            print(f'  {s}')
+    pos_idx = pos.nonzero(as_tuple=True)[0]
+    if len(pos_idx):
+        w = gen.windows[pos_idx]
+        o = off[pos_idx]
+        recovered = offset_decode(w, o)
+        print('Offset encode→decode round-trip (first positive):',
+              recovered[0].tolist())
+
+    if torch.cuda.is_available():
+        gen_cuda = gen.windows.cuda()
+        gt_boxes_cuda = gt_boxes.cuda()
+        off_c, pos_c = matcher.match(gen_cuda, gt_boxes_cuda)
+        print('CUDA match() succeeded, device:', off_c.device)
